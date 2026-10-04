@@ -15,13 +15,15 @@ use gpui::SharedString;
 
 use super::{CustomElement, CustomElementFactory, CustomRenderContext};
 use crate::markdown::parser::{parse, BlockTree};
-use crate::markdown::render::{render_tree, MdContext};
+use crate::markdown::render::{image_resource, image_sources, render_tree, ImageLoad, MdContext};
 use crate::markdown::veil::Veil;
 use crate::renderer::emit_event_full;
 use crate::theme::Theme;
 
 /// `linkClick` value sent by a code block's Wrap control.
 pub const CODE_WRAP_TOGGLE: &str = "gpuix:toggle-code-wrap";
+/// `linkClick` prefix for a click on an image, followed by its resolved source.
+pub const IMAGE_OPEN: &str = "gpuix:open-image:";
 
 pub struct MarkdownFactory;
 
@@ -48,6 +50,8 @@ pub struct MarkdownElement {
     /// Set while the source is still arriving; see [`Veil`].
     streaming: bool,
     veil: Option<Veil>,
+    /// Folder that relative image paths resolve against.
+    image_base: Option<std::path::PathBuf>,
 }
 
 impl MarkdownElement {
@@ -75,7 +79,7 @@ impl CustomElement for MarkdownElement {
         &mut self,
         ctx: CustomRenderContext,
         window: &mut gpui::Window,
-        _cx: &mut gpui::Context<crate::renderer::GpuixView>,
+        cx: &mut gpui::Context<crate::renderer::GpuixView>,
     ) -> gpui::AnyElement {
         use gpui::prelude::*;
 
@@ -114,6 +118,26 @@ impl CustomElement for MarkdownElement {
         );
         md.code_wrap = self.code_wrap;
         md.on_code_wrap = on_code_wrap;
+        // Images load through GPUI's asset cache, which redraws the view when
+        // one finishes; until then the block holds a placeholder.
+        let mut sources = Vec::new();
+        image_sources(&tree.blocks, &mut sources);
+        for src in sources {
+            let load = match image_resource(&src, self.image_base.as_deref()) {
+                None => ImageLoad::Unsupported,
+                Some(resource) => {
+                    match window.use_asset::<gpui::ImgResourceLoader>(&resource, cx) {
+                        None => ImageLoad::Loading,
+                        Some(Ok(image)) => {
+                            let size = image.size(0);
+                            ImageLoad::Ready(resource, size.width.0 as f32, size.height.0 as f32)
+                        }
+                        Some(Err(_)) => ImageLoad::Failed,
+                    }
+                }
+            };
+            md.images.insert(src, load);
+        }
         md.veil = if self.streaming {
             Some(self.veil.take().unwrap_or_default())
         } else {
@@ -149,6 +173,12 @@ impl CustomElement for MarkdownElement {
             "source" => self.source = value.as_str().unwrap_or("").to_string(),
             "theme" => self.theme = Theme::from_prop(Some(&value)),
             "codeWrap" => self.code_wrap = value.as_bool().unwrap_or(false),
+            "imageBase" => {
+                self.image_base = value
+                    .as_str()
+                    .filter(|base| !base.is_empty())
+                    .map(Into::into)
+            }
             "streaming" => {
                 self.streaming = value.as_bool().unwrap_or(false);
                 if !self.streaming {
@@ -160,7 +190,7 @@ impl CustomElement for MarkdownElement {
     }
 
     fn supported_props(&self) -> &'static [&'static str] {
-        &["source", "theme", "codeWrap", "streaming"]
+        &["source", "theme", "codeWrap", "streaming", "imageBase"]
     }
 
     fn supported_events(&self) -> &'static [&'static str] {

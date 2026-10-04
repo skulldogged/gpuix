@@ -24,6 +24,9 @@ pub struct InlineStyle {
     pub strikethrough: bool,
     /// Destination URL when inside a link.
     pub link: Option<String>,
+    /// The run is an image's alt text, and `link` its source. A paragraph's
+    /// images become [`Block::Image`]; elsewhere they stay links.
+    pub image: bool,
 }
 
 /// One run of identically-styled inline text.
@@ -59,6 +62,11 @@ pub enum Block {
         rows: Vec<Vec<Vec<InlineRun>>>,
         /// Per-column GFM alignment. Unspecified renders as Left.
         align: Vec<TableAlign>,
+    },
+    /// An image on its own. `src` is as written; the host resolves it.
+    Image {
+        src: String,
+        alt: String,
     },
     Rule,
 }
@@ -160,9 +168,7 @@ fn parse_started_block(cur: &mut Cursor) -> Vec<Block> {
         return Vec::new();
     };
     match tag {
-        Tag::Paragraph => vec![Block::Paragraph {
-            runs: parse_inline_container(cur, &InlineStyle::default()),
-        }],
+        Tag::Paragraph => split_images(parse_inline_container(cur, &InlineStyle::default())),
         Tag::Heading { level, .. } => vec![Block::Heading {
             level: heading_level(level),
             runs: parse_inline_container(cur, &InlineStyle::default()),
@@ -280,10 +286,40 @@ fn parse_block_sequence(cur: &mut Cursor) -> Vec<Block> {
 
 fn flush_paragraph(out: &mut Vec<Block>, acc: &mut Vec<InlineRun>) {
     if !acc.is_empty() {
-        out.push(Block::Paragraph {
-            runs: autolink_runs(merge_runs(std::mem::take(acc))),
-        });
+        out.extend(split_images(autolink_runs(merge_runs(std::mem::take(acc)))));
     }
+}
+
+/// A paragraph's images become blocks of their own, and the text around them
+/// stays as paragraphs. Whitespace alone between images is dropped.
+fn split_images(runs: Vec<InlineRun>) -> Vec<Block> {
+    if !runs.iter().any(|run| run.style.image) {
+        return vec![Block::Paragraph { runs }];
+    }
+    let mut blocks = Vec::new();
+    let mut text: Vec<InlineRun> = Vec::new();
+    let flush = |blocks: &mut Vec<Block>, text: &mut Vec<InlineRun>| {
+        if text.iter().any(|run| !run.text.trim().is_empty()) {
+            blocks.push(Block::Paragraph {
+                runs: std::mem::take(text),
+            });
+        } else {
+            text.clear();
+        }
+    };
+    for run in runs {
+        if run.style.image {
+            flush(&mut blocks, &mut text);
+            blocks.push(Block::Image {
+                src: run.style.link.unwrap_or_default(),
+                alt: run.text,
+            });
+        } else {
+            text.push(run);
+        }
+    }
+    flush(&mut blocks, &mut text);
+    blocks
 }
 
 fn parse_table(cur: &mut Cursor, align: Vec<TableAlign>) -> Block {
@@ -378,12 +414,26 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
                 Tag::Emphasis => inner.italic = true,
                 Tag::Strong => inner.bold = true,
                 Tag::Strikethrough => inner.strikethrough = true,
-                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
+                Tag::Link { dest_url, .. } => {
                     inner.link = Some(dest_url.into_string());
+                }
+                Tag::Image { dest_url, .. } => {
+                    inner.link = Some(dest_url.into_string());
+                    inner.image = true;
                 }
                 _ => {}
             }
-            runs.extend(parse_inline_container(cur, &inner));
+            let contents = parse_inline_container(cur, &inner);
+            if inner.image {
+                // One run per image, even with an empty or styled alt, so the
+                // image survives and is never split into several.
+                runs.push(InlineRun {
+                    text: contents.iter().map(|run| run.text.as_str()).collect(),
+                    style: inner,
+                });
+            } else {
+                runs.extend(contents);
+            }
         }
         // `End` is consumed by the container loop; anything else is ignored.
         _ => {}
@@ -490,7 +540,10 @@ fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out: Vec<InlineRun> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if last.style == run.style => last.text.push_str(&run.text),
+            // Two images side by side stay two images.
+            Some(last) if last.style == run.style && !run.style.image => {
+                last.text.push_str(&run.text)
+            }
             _ => out.push(run),
         }
     }

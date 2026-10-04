@@ -8,15 +8,17 @@
 //! exactly `lines × line_height`, and syntax highlighting arrives as recoloured
 //! `TextRun`s on the identical font, so layout never changes.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, font, px, AnyElement, BorderStyle, FontStyle, FontWeight, Hsla, SharedString, TextRun,
-    UnderlineStyle, Window,
+    div, font, px, AnyElement, BorderStyle, FontStyle, FontWeight, Hsla, Resource, SharedString,
+    SharedUri, TextRun, UnderlineStyle, Window,
 };
 
-use super::parser::{Block, BlockTree, InlineRun, TableAlign};
+use super::parser::{Block, BlockTree, InlineRun, InlineStyle, TableAlign};
 use crate::syntax::cache::highlight_cached;
 use crate::text::{range_rects, runs::runs_for_spans, SharedSelection};
 use crate::theme::{Metrics, Theme};
@@ -185,6 +187,85 @@ pub struct MdContext {
     pub on_code_wrap: Option<Arc<dyn Fn()>>,
     /// Present while the document streams: text it gains fades in.
     pub veil: Option<super::veil::Veil>,
+    /// How far each image `src` in the document has loaded. Filled before
+    /// rendering by the element, which has the window and app a load needs.
+    pub images: HashMap<String, ImageLoad>,
+    next_image: usize,
+}
+
+/// An image's state for this frame.
+#[derive(Clone)]
+pub enum ImageLoad {
+    /// Not a web URL or a file, so it stays a link.
+    Unsupported,
+    Loading,
+    /// Loaded, with its size in pixels.
+    Ready(Resource, f32, f32),
+    Failed,
+}
+
+/// Where an image's `src` points: a web URL, or a file, with a relative path
+/// resolved against `base`. Anything else, such as a data URL, stays a link.
+pub fn image_resource(src: &str, base: Option<&Path>) -> Option<Resource> {
+    let src = src.trim();
+    let scheme = src.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+    let path = match scheme.as_deref() {
+        Some("http" | "https") => return Some(Resource::Uri(SharedUri::from(src.to_string()))),
+        Some("file") => {
+            let rest = percent_decode(&src["file://".len()..]);
+            // `file:///C:/x` names `C:/x` on Windows.
+            match rest.strip_prefix('/') {
+                Some(drive) if cfg!(windows) && drive.get(1..2) == Some(":") => drive.into(),
+                _ => rest,
+            }
+        }
+        Some(_) => return None,
+        None if src.starts_with("data:") || src.is_empty() => return None,
+        None => src.to_string(),
+    };
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base?.join(path)
+    };
+    Some(Resource::Path(path.into()))
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
+            (b'%', Some(a), Some(b)) if hex(a).is_some() && hex(b).is_some() => {
+                out.push((hex(a).unwrap() * 16 + hex(b).unwrap()) as u8);
+                i += 3;
+            }
+            (byte, ..) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Every image `src` in the tree, in document order.
+pub fn image_sources(blocks: &[Block], out: &mut Vec<String>) {
+    for block in blocks {
+        match block {
+            Block::Image { src, .. } if !out.contains(src) => out.push(src.clone()),
+            Block::BlockQuote { children } => image_sources(children, out),
+            Block::List { items, .. } => {
+                for item in items {
+                    image_sources(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl MdContext {
@@ -209,6 +290,8 @@ impl MdContext {
             code_wrap: false,
             on_code_wrap: None,
             veil: None,
+            images: HashMap::new(),
+            next_image: 0,
         }
     }
 
@@ -350,11 +433,105 @@ pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyE
             rows,
             align,
         } => render_table(header, rows, align, ctx, window),
+        Block::Image { src, alt } => render_image(src, alt, ctx),
         Block::Rule => div()
             .h(px(1.0))
             .w_full()
             .bg(theme.border)
             .into_any_element(),
+    }
+}
+
+/// An image at its own aspect ratio, as wide as the column allows and no
+/// taller than `md_image_max_height`, with its alt text and source beneath.
+/// Clicking it reports [`crate::custom_elements::markdown::IMAGE_OPEN`] and the
+/// resolved source through `on_link`. One that cannot load stays a link.
+fn render_image(src: &str, alt: &str, ctx: &mut MdContext) -> AnyElement {
+    use gpui::prelude::*;
+
+    let theme = ctx.theme.clone();
+    let m = &theme.metrics;
+    let ix = ctx.next_image;
+    ctx.next_image += 1;
+    let element_id = ctx.element_id;
+    match ctx.images.get(src).cloned() {
+        Some(ImageLoad::Ready(resource, width, height)) if width > 0.0 && height > 0.0 => {
+            let ratio = width / height;
+            let target = match &resource {
+                Resource::Uri(uri) => uri.to_string(),
+                Resource::Path(path) => path.display().to_string(),
+                Resource::Embedded(name) => name.to_string(),
+            };
+            let mut picture = div()
+                .id(SharedString::from(format!("__gpuix_md_image_{element_id}_{ix}")))
+                .w_full()
+                .max_w(px(width.min(m.md_image_max_height * ratio)))
+                .aspect_ratio(ratio)
+                .rounded(px(m.md_code_radius))
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    gpui::img(gpui::ImageSource::Resource(resource))
+                        .size_full()
+                        .rounded(px((m.md_code_radius - 1.0).max(0.0))),
+                );
+            if let Some(open) = ctx.on_link.clone() {
+                picture = picture.cursor_pointer().on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    open(&format!(
+                        "{}{target}",
+                        crate::custom_elements::markdown::IMAGE_OPEN
+                    ));
+                });
+            }
+            let caption = if alt.trim().is_empty() {
+                src.to_string()
+            } else {
+                format!("{} · {src}", alt.trim())
+            };
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(picture)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(m.md_code_header_text_size))
+                        .text_color(theme.text_muted)
+                        .child(crate::text::chrome_text(SharedString::from(caption), None)),
+                )
+                .into_any_element()
+        }
+        Some(ImageLoad::Loading) => div()
+            .w_full()
+            .h(px(m.md_image_max_height.min(160.0)))
+            .rounded(px(m.md_code_radius))
+            .bg(ink(&theme, 0.035))
+            .into_any_element(),
+        _ => {
+            let text = if alt.trim().is_empty() { src } else { alt };
+            let link = InlineRun {
+                text: text.to_string(),
+                style: InlineStyle {
+                    link: Some(src.to_string()),
+                    ..Default::default()
+                },
+            };
+            text_element(
+                &[link],
+                m.md_text_size,
+                m.md_line_height,
+                FontWeight::NORMAL,
+                ctx,
+            )
+        }
     }
 }
 
