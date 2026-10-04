@@ -1,0 +1,138 @@
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 581498b..4d4530a 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -730,6 +730,8 @@ pub(crate) type AnyMouseListener =
+ #[derive(Clone)]
+ pub(crate) struct CursorStyleRequest {
+     pub(crate) hitbox_id: Option<HitboxId>,
++    /// The element that asked, so its cursor shows over its descendants too.
++    pub(crate) identity: Option<GlobalElementId>,
+     pub(crate) style: CursorStyle,
+ }
+ 
+@@ -737,6 +739,8 @@ pub(crate) struct CursorStyleRequest {
+ pub(crate) struct HitTest {
+     pub(crate) ids: SmallVec<[HitboxId; 8]>,
+     pub(crate) hover_hitbox_count: usize,
++    /// The elements of the hovered hitboxes, the first `hover_hitbox_count` of `ids`.
++    pub(crate) hovered_identities: SmallVec<[GlobalElementId; 4]>,
+ }
+ 
+ /// A type of window control area that corresponds to the platform window.
+@@ -855,6 +859,22 @@ impl Hitbox {
+         self.id.is_hovered(window)
+     }
+ 
++    /// Like [`Hitbox::is_hovered`], but also true while the mouse is over a hitbox of one of
++    /// this element's descendants, as CSS `:hover` and `mouseenter` treat an element. A
++    /// descendant that blocks the mouse takes hover from what it covers, not from its own
++    /// ancestors. Hover listeners and hover styles use this; clicks use `is_hovered`.
++    pub fn contains_hovered(&self, window: &Window) -> bool {
++        if self.is_hovered(window) {
++            return true;
++        }
++        window.captured_hitbox.is_none()
++            && !window.last_input_was_keyboard()
++            && self
++                .identity
++                .as_ref()
++                .is_some_and(|identity| window.hover_is_within(identity))
++    }
++
+     /// Checks if the hitbox contains the mouse and should handle scroll events. Typically this
+     /// should only be used when handling `ScrollWheelEvent`, and otherwise `is_hovered` should be
+     /// used. See the documentation of `Hitbox::is_hovered` for details about this distinction.
+@@ -1078,8 +1098,12 @@ impl Frame {
+             .fold_while(None, |style, request| match request.hitbox_id {
+                 None => Done(Some(request.style)),
+                 Some(hitbox_id) => Continue(style.or_else(|| {
+-                    hitbox_id
+-                        .is_hovered_ignoring_last_input(window)
++                    let within = window.captured_hitbox.is_none()
++                        && request
++                            .identity
++                            .as_ref()
++                            .is_some_and(|identity| window.hover_is_within(identity));
++                    (within || hitbox_id.is_hovered_ignoring_last_input(window))
+                         .then_some(request.style)
+                 })),
+             })
+@@ -1093,6 +1117,9 @@ impl Frame {
+             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+             if bounds.contains(&position) {
+                 hit_test.ids.push(hitbox.id);
++                if !set_hover_hitbox_count {
++                    hit_test.hovered_identities.extend(hitbox.identity.clone());
++                }
+                 if !set_hover_hitbox_count
+                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
+                 {
+@@ -3606,10 +3633,19 @@ impl Window {
+         self.invalidator.debug_assert_paint();
+         self.next_frame.cursor_styles.push(CursorStyleRequest {
+             hitbox_id: Some(hitbox.id),
++            identity: hitbox.identity.clone(),
+             style,
+         });
+     }
+ 
++    /// Whether a hovered hitbox belongs to the element `identity` or one of its descendants.
++    pub(crate) fn hover_is_within(&self, identity: &GlobalElementId) -> bool {
++        self.mouse_hit_test
++            .hovered_identities
++            .iter()
++            .any(|hovered| hovered.0.starts_with(&identity.0))
++    }
++
+     /// Updates the cursor style for the entire window at the platform level. A cursor
+     /// style using this method will have precedence over any cursor style set using
+     /// `set_cursor_style`. This method should only be called during the paint
+@@ -3618,6 +3654,7 @@ impl Window {
+         self.invalidator.debug_assert_paint();
+         self.next_frame.cursor_styles.push(CursorStyleRequest {
+             hitbox_id: None,
++            identity: None,
+             style,
+         })
+     }
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index 7013170..da1f3a7 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2819,7 +2819,7 @@ impl Interactivity {
+             let current_view = window.current_view();
+ 
+             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+-                let hovered = hitbox.is_hovered(window);
++                let hovered = hitbox.contains_hovered(window);
+                 let was_hovered = hover_state
+                     .as_ref()
+                     .is_some_and(|state| state.borrow().element);
+@@ -3114,7 +3114,7 @@ impl Interactivity {
+                 };
+ 
+                 if has_mouse_down.borrow().is_none() {
+-                    let is_hovered = !cx.has_active_drag() && hitbox.is_hovered(window);
++                    let is_hovered = !cx.has_active_drag() && hitbox.contains_hovered(window);
+                     if is_hovered != *was_hovered.borrow() {
+                         let update_hover = update_hover.clone();
+                         window.defer(cx, move |window, cx| {
+@@ -3130,7 +3130,7 @@ impl Interactivity {
+                         if phase == DispatchPhase::Bubble {
+                             let is_hovered = has_mouse_down.borrow().is_none()
+                                 && !cx.has_active_drag()
+-                                && hitbox.is_hovered(window);
++                                && hitbox.contains_hovered(window);
+                             update_hover(is_hovered, window, cx);
+                         }
+                     }
+@@ -3447,7 +3447,7 @@ impl Interactivity {
+ 
+             if let Some(hover_style) = self.hover_style.as_ref() {
+                 let is_hovered = if let Some(hitbox) = hitbox {
+-                    hitbox.is_hovered(window)
++                    hitbox.contains_hovered(window)
+                 } else if let Some(element_state) = element_state.as_ref() {
+                     element_state
+                         .hover_state

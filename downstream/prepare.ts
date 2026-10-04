@@ -25,6 +25,7 @@ const STACK = [
   "gpui-frame-work.patch",
   "gpui-windows-startup-show.patch",
   "gpui-unsnapped-glyphs.patch",
+  "gpui-hover-descendants.patch",
 ];
 
 function run(args: string[], cwd: string) {

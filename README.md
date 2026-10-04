@@ -2185,6 +2185,13 @@ A `div` that paints a fill, or that is positioned, blocks clicks and hovers
 behind it. The **wheel still passes**, so a pannable canvas can place its items
 absolutely and keep panning.
 
+Hover follows CSS: an element counts as hovered while the pointer is over one
+of its descendants. A filled or positioned child blocks hover for what it
+covers, not for its own ancestors, so a card stays hovered (`mouseEnter`,
+`hover` styles) while the pointer is on a play button inside it, and the
+card's `cursor` shows there unless the button sets its own. Clicks still go
+to the topmost element only.
+
 Set **`pointerEvents: "auto"`** on an element that must swallow the wheel too,
 like a modal backdrop. `<anchored>` occludes by default and has its own
 `occlude` prop, so menus and tooltips need neither.

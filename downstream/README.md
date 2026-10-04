@@ -33,6 +33,9 @@ GPUI (`downstream/zed`):
   for a hidden first window, as `bun run` does.
 - `Window::paint_glyph_unsnapped` places a glyph to a quarter pixel
   vertically, so text that moves slowly glides instead of stepping.
+- Hover listeners, hover styles and cursors count an element as hovered
+  while the mouse is over one of its descendants, as CSS does. A blocking
+  overlay inside a hovered card no longer un-hovers the card.
 
 GPUIX:
 
