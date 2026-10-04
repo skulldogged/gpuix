@@ -468,6 +468,116 @@ fn cubic_bezier(x: f64, [x1, y1, x2, y2]: [f64; 4]) -> f64 {
     sample((low + high) / 2.0, y1, y2).clamp(0.0, 1.0)
 }
 
+/// Hover transitions. `hover` colors and opacity ease in and out instead of
+/// switching on the frame the pointer crosses an edge; other `hover`
+/// properties stay GPUI refinements, which apply instantly.
+const HOVER_IN: f64 = 0.10;
+const HOVER_OUT: f64 = 0.18;
+
+struct HoverTrack {
+    hovered: bool,
+    since: Instant,
+    /// Progress toward the hover style when this transition started.
+    from: f64,
+}
+
+thread_local! {
+    static HOVERS: std::cell::RefCell<std::collections::HashMap<u64, HoverTrack>> =
+        Default::default();
+}
+
+impl HoverTrack {
+    /// Progress toward the hover style, eased out, and whether it is still moving.
+    fn progress(&self, now: Instant) -> (f64, bool) {
+        let (target, duration) = if self.hovered {
+            (1.0, HOVER_IN)
+        } else {
+            (0.0, HOVER_OUT)
+        };
+        let t = (now.saturating_duration_since(self.since).as_secs_f64() / duration).min(1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        (self.from + (target - self.from) * eased, t < 1.0)
+    }
+}
+
+/// Whether a `hover` style has anything a transition can ease.
+pub(crate) fn hover_is_animatable(style: &StyleDesc) -> bool {
+    style.hover.as_deref().is_some_and(|hover| {
+        hover.background_color.is_some()
+            || hover.border_color.is_some()
+            || hover.color.is_some()
+            || hover.opacity.is_some()
+    })
+}
+
+/// Records the pointer entering or leaving an element, continuing from
+/// wherever an interrupted transition had reached.
+pub(crate) fn set_hovered(id: u64, hovered: bool) {
+    let now = Instant::now();
+    HOVERS.with(|hovers| {
+        let mut hovers = hovers.borrow_mut();
+        let from = hovers
+            .get(&id)
+            .map_or(if hovered { 0.0 } else { 1.0 }, |track| track.progress(now).0);
+        hovers.insert(id, HoverTrack { hovered, since: now, from });
+    });
+}
+
+/// `style` with its `hover` colors and opacity blended in by the element's
+/// hover progress and removed from the refinement. The flag is true while the
+/// transition is still running.
+pub(crate) fn hover_blended(id: u64, style: &StyleDesc, now: Instant) -> Option<(StyleDesc, bool)> {
+    if !hover_is_animatable(style) {
+        return None;
+    }
+    let hover = style.hover.as_deref()?;
+    let (progress, active) = HOVERS.with(|hovers| {
+        let mut hovers = hovers.borrow_mut();
+        let state = hovers.get(&id).map(|track| (track.progress(now), track.hovered));
+        match state {
+            Some(((progress, active), hovered)) => {
+                if !active && !hovered {
+                    hovers.remove(&id);
+                }
+                (progress, active)
+            }
+            None => (0.0, false),
+        }
+    });
+    let parse = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(crate::color::parse_color_rgba)
+            .map(|c| MotionColor([c.r, c.g, c.b, c.a]))
+    };
+    let blend = |base: &Option<String>, target: &Option<String>| -> Option<String> {
+        let target = parse(target)?;
+        let base = parse(base).unwrap_or(MotionColor([target.0[0], target.0[1], target.0[2], 0.0]));
+        Some(base.mix(target, progress).css())
+    };
+    let mut out = style.clone();
+    let mut rest = hover.clone();
+    if hover.background_color.is_some() && style.background.is_none() {
+        out.background_color = blend(&style.background_color, &hover.background_color);
+        rest.background_color = None;
+    }
+    if hover.border_color.is_some() {
+        out.border_color = blend(&style.border_color, &hover.border_color);
+        rest.border_color = None;
+    }
+    if hover.color.is_some() {
+        out.color = blend(&style.color, &hover.color);
+        rest.color = None;
+    }
+    if let Some(target) = hover.opacity {
+        let base = style.opacity.unwrap_or(1.0);
+        out.opacity = Some(base + (target - base) * progress);
+        rest.opacity = None;
+    }
+    out.hover = Some(Box::new(rest));
+    Some((out, active))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4983,6 +4983,11 @@ pub(crate) fn build_element(
         None
     };
     let style = animated_style.as_ref().or(element.style.as_deref());
+    let hovered_style = style.and_then(|style| crate::motion::hover_blended(id, style, ctx.now));
+    if hovered_style.as_ref().is_some_and(|(_, active)| *active) {
+        window.request_animation_frame();
+    }
+    let style = hovered_style.as_ref().map(|(style, _)| style).or(style);
 
     // Inheritable style resolves once here so both built-ins and custom
     // elements see the same cascade.
@@ -5490,7 +5495,15 @@ pub(crate) fn build_host_container(
                     } else {
                         None
                     };
-                    el = el.on_hover(move |&is_hovered, _window, _cx| {
+                    let transition = element
+                        .style
+                        .as_deref()
+                        .is_some_and(crate::motion::hover_is_animatable);
+                    el = el.on_hover(move |&is_hovered, window, _cx| {
+                        if transition {
+                            crate::motion::set_hovered(id, is_hovered);
+                            window.refresh();
+                        }
                         if is_hovered {
                             emit_event_full(&callback_enter, id, "mouseEnter", |p| {
                                 p.hovered = Some(true);
@@ -5583,6 +5596,22 @@ pub(crate) fn build_host_container(
 
             _ => {}
         }
+    }
+
+    // GPUI has one hover listener per element; the enter/leave wiring above
+    // also tracks hover transitions, so this covers elements without it.
+    if !element.events.contains("mouseEnter")
+        && !element.events.contains("mouseLeave")
+        && element
+            .style
+            .as_deref()
+            .is_some_and(crate::motion::hover_is_animatable)
+    {
+        let id = element.id;
+        el = el.on_hover(move |&is_hovered, window, _cx| {
+            crate::motion::set_hovered(id, is_hovered);
+            window.refresh();
+        });
     }
 
     if element.events.contains("mouseDown") && element.events.contains("mouseMove") {
