@@ -471,6 +471,9 @@ pub struct Theme {
     pub font_sans: String,
     /// Monospace family for code, diffs and terminals.
     pub font_mono: String,
+    /// Family for inline code inside prose; `font_mono` when unset. A line has
+    /// one font size, so a size-adjusted face is how inline code sits smaller.
+    pub font_mono_inline: Option<String>,
     /// Every layout number. Overridable from JS, so a design tweak needs no
     /// native rebuild.
     pub metrics: Metrics,
@@ -496,6 +499,7 @@ impl Theme {
             syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
             font_sans: system_sans().to_string(),
             font_mono: system_mono().to_string(),
+            font_mono_inline: None,
             metrics: Metrics::default(),
         }
     }
@@ -519,6 +523,7 @@ impl Theme {
             syntax: SyntaxPalette::dark(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
             font_sans: system_sans().to_string(),
             font_mono: system_mono().to_string(),
+            font_mono_inline: None,
             metrics: Metrics::default(),
         }
     }
@@ -546,6 +551,9 @@ impl Theme {
         }
         if let Some(font) = &o.font_sans {
             self.font_sans = font.clone();
+        }
+        if let Some(font) = &o.font_mono_inline {
+            self.font_mono_inline = Some(font.clone());
         }
         if let Some(metrics) = &o.metrics {
             self.metrics.apply(metrics);
@@ -659,6 +667,7 @@ pub struct ThemeOverride {
     pub diff_hunk_bg: Option<String>,
     pub font_sans: Option<String>,
     pub font_mono: Option<String>,
+    pub font_mono_inline: Option<String>,
     pub syntax: Option<SyntaxOverride>,
     pub metrics: Option<MetricsOverride>,
 }

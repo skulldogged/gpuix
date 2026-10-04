@@ -92,7 +92,12 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) 
         text.push_str(&run.text);
 
         let mut f = if run.style.code {
-            font(theme.font_mono.clone())
+            font(
+                theme
+                    .font_mono_inline
+                    .clone()
+                    .unwrap_or_else(|| theme.font_mono.clone()),
+            )
         } else {
             font(theme.font_sans.clone())
         };
