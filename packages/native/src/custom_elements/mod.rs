@@ -123,8 +123,8 @@ pub(crate) fn custom_surface(
     if let Some(style) = ctx.style {
         el = crate::renderer::apply_interactive_styles(el, style);
     }
-    // `bounds_tracker` is `absolute().size_full()`, so it needs a positioned
-    // parent to measure.
+    // Positioned, as a `<div>` is, so absolutely placed children measure
+    // against this box.
     if ctx
         .style
         .and_then(|style| style.position.as_deref())
@@ -135,10 +135,12 @@ pub(crate) fn custom_surface(
     // An explicit `userSelect` claims the box as a selection-start region, as
     // it does on `<div>`; without it a `userSelect: "text"` Markdown under a
     // `"none"` ancestor would paint selectable text that no drag can start.
-    el = el.child(crate::automation::bounds_tracker(
+    el = crate::automation::track_padding_bounds(
+        el,
         ctx.id,
+        crate::renderer::border_widths(ctx.style),
         crate::renderer::selection_start_flag(ctx.style),
-    ));
+    );
     el = crate::accessibility::apply_accessibility(el, ctx.props, None);
     wire_standard_events(el, ctx)
 }

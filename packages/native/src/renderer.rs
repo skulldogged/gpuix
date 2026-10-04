@@ -5353,10 +5353,12 @@ pub(crate) fn build_host_container(
     if style.and_then(|style| style.position.as_deref()).is_none() {
         el = el.relative();
     }
-    el = el.child(crate::automation::bounds_tracker(
+    el = crate::automation::track_padding_bounds(
+        el,
         element.id,
+        border_widths(style),
         selection_start_flag(style),
-    ));
+    );
 
     if let Some(handle) = ctx.focus_handles.get(&element.id) {
         el = el.track_focus(handle);
@@ -5680,6 +5682,21 @@ fn text_content(
             ctx.inherited.selection_wash,
         )
     })
+}
+
+/// An element's border widths as its style declares them, for the padding box.
+pub(crate) fn border_widths(style: Option<&StyleDesc>) -> gpui::Edges<gpui::Pixels> {
+    let Some(style) = style else {
+        return gpui::Edges::default();
+    };
+    let all = style.border_width.unwrap_or(0.0);
+    let side = |width: Option<f64>| gpui::px(width.unwrap_or(all).max(0.0) as f32);
+    gpui::Edges {
+        top: side(style.border_top_width),
+        right: side(style.border_right_width),
+        bottom: side(style.border_bottom_width),
+        left: side(style.border_left_width),
+    }
 }
 
 /// Explicit `userSelect` on this node. `None` means inherit; the ancestor

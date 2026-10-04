@@ -69,6 +69,32 @@ pub fn track_own_bounds<E: gpui::InteractiveElement>(el: E, id: u64) -> E {
     el.on_painted(move |bounds, _, _| record_bounds(id, bounds))
 }
 
+/// Record this element's padding box as it paints, as `bounds_tracker` does,
+/// without adding an element. Every `<div>` and `<text>` carried a tracker
+/// child, which doubled the elements each frame laid out and painted.
+/// `border` is the element's border widths: the padding box is the border box
+/// inset by them, which is where the tracker's absolute child sat.
+pub fn track_padding_bounds<E: gpui::InteractiveElement>(
+    el: E,
+    id: u64,
+    border: gpui::Edges<Pixels>,
+    selection_start: Option<bool>,
+) -> E {
+    el.on_painted(move |bounds, _, _| {
+        let bounds = Bounds::from_corners(
+            gpui::point(bounds.left() + border.left, bounds.top() + border.top),
+            gpui::point(
+                bounds.right() - border.right,
+                bounds.bottom() - border.bottom,
+            ),
+        );
+        record_bounds(id, bounds);
+        if let Some(selectable) = selection_start {
+            crate::text::record_start_region(bounds, selectable);
+        }
+    })
+}
+
 pub fn record_bounds(id: u64, bounds: Bounds<Pixels>) {
     BOUNDS.with(|cell| {
         cell.borrow_mut()
