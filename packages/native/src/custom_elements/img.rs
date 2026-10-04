@@ -122,11 +122,145 @@ fn http_image_uri(src: &str) -> Option<gpui::SharedUri> {
     (src.len() > scheme_end + 3).then(|| gpui::SharedUri::from(src.to_string()))
 }
 
-/// Install the GPUI HTTP client so `<img src="https://…">` can fetch.
+/// Decoded `<img>` files and URLs, bounded in memory.
+///
+/// GPUI's default is to keep every image an `img()` ever loaded, decoded, until
+/// the app exits, which an image-heavy app such as a music library grows
+/// without limit. This cache keeps them by last use instead. An image counts
+/// as used in a frame when its element lays out, which every visible `<img>`
+/// does on every frame: a region holding one is never replayed from a cache.
+/// So at the start of a frame, anything the previous frame did not draw can be
+/// dropped from the GPU atlas without leaving a stale sprite behind.
+pub struct ImageMemory {
+    entries: std::collections::HashMap<u64, ImageMemoryEntry>,
+    budget: usize,
+    used: usize,
+    frame: u64,
+}
+
+struct ImageMemoryEntry {
+    item: gpui::ImageCacheItem,
+    bytes: usize,
+    last_used: u64,
+}
+
+struct GlobalImageMemory(gpui::Entity<ImageMemory>);
+
+impl gpui::Global for GlobalImageMemory {}
+
+fn image_bytes(image: &gpui::RenderImage) -> usize {
+    (0..image.frame_count())
+        .map(|frame| {
+            let size = image.size(frame);
+            size.width.0.max(0) as usize * size.height.0.max(0) as usize * 4
+        })
+        .sum()
+}
+
+impl ImageMemory {
+    /// Start a frame: drop images the last frame did not draw while the cache
+    /// is over budget, least recently used first. Failed loads are forgotten
+    /// once unused, so a remounted image tries again.
+    pub fn begin_frame(window: &mut gpui::Window, cx: &mut gpui::App) {
+        let Some(memory) = cx.try_global::<GlobalImageMemory>().map(|g| g.0.clone()) else {
+            return;
+        };
+        let evicted = memory.update(cx, |memory, _| {
+            memory.frame += 1;
+            let keep_after = memory.frame.saturating_sub(2);
+            let mut evicted = Vec::new();
+            memory.entries.retain(|_, entry| {
+                let failed = matches!(entry.item, gpui::ImageCacheItem::Loaded(Err(_)));
+                !(failed && entry.last_used <= keep_after)
+            });
+            if memory.used <= memory.budget {
+                return evicted;
+            }
+            let mut idle: Vec<(u64, u64)> = memory
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.bytes > 0 && entry.last_used <= keep_after)
+                .map(|(key, entry)| (entry.last_used, *key))
+                .collect();
+            idle.sort_unstable();
+            for (_, key) in idle {
+                if memory.used <= memory.budget {
+                    break;
+                }
+                if let Some(mut entry) = memory.entries.remove(&key) {
+                    memory.used -= entry.bytes;
+                    if let Some(Ok(image)) = entry.item.get() {
+                        evicted.push(image);
+                    }
+                }
+            }
+            evicted
+        });
+        for image in evicted {
+            cx.drop_image(image, Some(window));
+        }
+    }
+}
+
+impl gpui::ImageCache for ImageMemory {
+    fn load(
+        &mut self,
+        resource: &gpui::Resource,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
+        use futures::FutureExt as _;
+        use gpui::Asset as _;
+        let key = gpui::hash(resource);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = self.frame;
+            let result = entry.item.get();
+            if entry.bytes == 0 {
+                if let Some(Ok(image)) = &result {
+                    entry.bytes = image_bytes(image);
+                    self.used += entry.bytes;
+                }
+            }
+            return result;
+        }
+
+        let load = gpui::AssetLogger::<gpui::ImageAssetLoader>::load(resource.clone(), cx);
+        let task = cx.background_executor().spawn(load).shared();
+        self.entries.insert(
+            key,
+            ImageMemoryEntry {
+                item: gpui::ImageCacheItem::Loading(task.clone()),
+                bytes: 0,
+                last_used: self.frame,
+            },
+        );
+        let view = window.current_view();
+        window
+            .spawn(cx, async move |cx| {
+                _ = task.await;
+                cx.on_next_frame(move |_, cx| cx.notify(view));
+            })
+            .detach();
+        None
+    }
+}
+
+/// Install the GPUI HTTP client so `<img src="https://…">` can fetch, and the
+/// image memory every `<img>` loads through. `budget_mb` bounds the decoded
+/// images kept while not on screen.
 ///
 /// Web already gets `fetch` from `gpui_platform::single_threaded_web`. Desktop
 /// Application defaults to `NullHttpClient`, which fails every URI load.
-pub fn init(cx: &mut gpui::App) {
+pub fn init(cx: &mut gpui::App, budget_mb: Option<f64>) {
+    use gpui::AppContext as _;
+    let budget = (budget_mb.unwrap_or(256.0).max(16.0) * 1024.0 * 1024.0) as usize;
+    let memory = cx.new(|_| ImageMemory {
+        entries: Default::default(),
+        budget,
+        used: 0,
+        frame: 0,
+    });
+    cx.set_global(GlobalImageMemory(memory));
     #[cfg(not(target_family = "wasm"))]
     match reqwest_client::ReqwestClient::user_agent("gpuix") {
         Ok(client) => cx.set_http_client(std::sync::Arc::new(client)),
@@ -198,6 +332,12 @@ impl CustomElement for ImgElement {
             ImgSource::Render(image) => gpui::img(image.clone()),
             ImgSource::Empty => return img_fallback(&ctx, &self.alt, "img: no src"),
             ImgSource::Invalid => return img_fallback(&ctx, &self.alt, "img: load failed"),
+        };
+        // Files and URLs load through the bounded image memory; data and
+        // pixel sources are owned by this element already.
+        let el = match _cx.try_global::<GlobalImageMemory>() {
+            Some(memory) => el.image_cache(&memory.0),
+            None => el,
         };
         // The id is what makes gpui's `ImgState` persist. Without it `Img` has no
         // `GlobalElementId`, so the animated-GIF frame index and the delayed

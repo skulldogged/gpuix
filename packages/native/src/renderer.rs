@@ -1219,10 +1219,11 @@ impl GpuixRenderer {
         let app = gpui::Application::with_platform(platform.clone())
             .with_quit_mode(gpui::QuitMode::LastWindowClosed);
         let fonts = options.fonts.clone().unwrap_or_default();
+        let image_memory_mb = options.image_memory_mb;
         let app_handle = app.run_embedded(move |cx: &mut gpui::App| {
             crate::window_state::init(cx, &fonts);
             crate::custom_elements::input::init(cx);
-            crate::custom_elements::img::init(cx);
+            crate::custom_elements::img::init(cx, image_memory_mb);
             // After the other bindings: `set_menus` reads key equivalents out of
             // the keymap, so every binding must exist before it runs.
             crate::app_menu::init(&app_name, cx);
@@ -1358,8 +1359,9 @@ impl GpuixRenderer {
                                 cx,
                                 window_options.fonts.as_deref().unwrap_or_default(),
                             );
+                            let image_memory_mb = window_options.image_memory_mb;
                             crate::custom_elements::input::init(cx);
-                            crate::custom_elements::img::init(cx);
+                            crate::custom_elements::img::init(cx, image_memory_mb);
                             let size = gpui::size(gpui::px(width as f32), gpui::px(height as f32));
                             // A layer-shell surface is positioned by the compositor from its
                             // anchor, so it opens at the origin; a normal window is centered.
@@ -5041,6 +5043,7 @@ impl gpui::Render for GpuixView {
             self.applied_window_title = Some(self.window_title.clone());
         }
         crate::window_state::update(window, cx);
+        crate::custom_elements::img::ImageMemory::begin_frame(window, cx);
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if let Some(id) = PENDING_FOCUS_ELEMENT.with(|pending| pending.borrow_mut().take()) {
@@ -7285,6 +7288,9 @@ pub struct WindowOptions {
     /// Font files to load before the window opens, so styles can name their
     /// families without the fonts being installed.
     pub fonts: Option<Vec<String>>,
+    /// Decoded `<img>` files and URLs kept in memory while off screen, in MB.
+    /// Defaults to 256; the least recently drawn go first.
+    pub image_memory_mb: Option<f64>,
     /// `"opaque"` | `"transparent"` | `"blurred"`. `transparent: true` is the
     /// same as `"transparent"` when this is unset.
     pub window_background: Option<String>,
@@ -7320,6 +7326,7 @@ impl Default for WindowOptions {
             titlebar_transparent: Some(false),
             client_decorations: Some(false),
             fonts: None,
+            image_memory_mb: None,
             window_background: None,
             traffic_light_x: None,
             traffic_light_y: None,
