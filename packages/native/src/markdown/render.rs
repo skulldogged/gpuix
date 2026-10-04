@@ -185,8 +185,14 @@ pub struct MdContext {
     /// Present when the host lets the reader toggle `code_wrap`; adds a Wrap
     /// control to each code block header.
     pub on_code_wrap: Option<Arc<dyn Fn()>>,
-    /// Present while the document streams: text it gains fades in.
+    /// Present while the document streams, and until its fades finish:
+    /// blocks and text it gains fade in.
     pub veil: Option<super::veil::Veil>,
+    /// Sibling indices from the top down to the block being rendered, which
+    /// is how the veil tells blocks apart across frames.
+    path: Vec<usize>,
+    /// Set inside a block that arrived this frame: its contents fade with it.
+    arriving: bool,
     /// How far each image `src` in the document has loaded. Filled before
     /// rendering by the element, which has the window and app a load needs.
     pub images: HashMap<String, ImageLoad>,
@@ -290,6 +296,8 @@ impl MdContext {
             code_wrap: false,
             on_code_wrap: None,
             veil: None,
+            path: Vec::new(),
+            arriving: false,
             images: HashMap::new(),
             next_image: 0,
         }
@@ -304,8 +312,35 @@ impl MdContext {
     /// `runs` for piece `sub`, with any text it just gained fading in.
     fn veiled(&mut self, sub: usize, text: &str, runs: Vec<TextRun>) -> Vec<TextRun> {
         match &mut self.veil {
-            Some(veil) => veil.runs(sub, text, runs),
+            Some(veil) => veil.runs(sub, text, runs, self.arriving),
             None => runs,
+        }
+    }
+
+    /// `render` for child `ix` of the current block, faded as a whole, chrome
+    /// included, while it is new to a streaming document. GPUI's element
+    /// opacity scales every glyph, quad and image inside, and the wrapper is
+    /// a plain block like the gap wrapper [`stack`] already puts around every
+    /// child but the first, so it moves nothing.
+    fn fade_in(&mut self, ix: usize, render: impl FnOnce(&mut Self) -> AnyElement) -> AnyElement {
+        use gpui::prelude::*;
+
+        if self.veil.is_none() {
+            return render(self);
+        }
+        self.path.push(ix);
+        let (opacity, arrived) = match &mut self.veil {
+            Some(veil) => veil.block(&self.path, self.arriving),
+            None => (None, false),
+        };
+        let outer = self.arriving;
+        self.arriving = outer || arrived;
+        let element = render(self);
+        self.arriving = outer;
+        self.path.pop();
+        match opacity {
+            Some(opacity) => div().opacity(opacity).child(element).into_any_element(),
+            None => element,
         }
     }
 }
@@ -320,14 +355,17 @@ pub fn render_tree(tree: &BlockTree, ctx: &mut MdContext, window: &Window) -> An
     use gpui::prelude::*;
 
     let block_gap = ctx.theme.metrics.md_block_gap;
-    stack(
-        tree.blocks
-            .iter()
-            .map(|block| render_block(block, ctx, window))
-            .collect::<Vec<_>>(),
-        block_gap,
-    )
-    .into_any_element()
+    stack(render_blocks(&tree.blocks, ctx, window), block_gap).into_any_element()
+}
+
+/// `blocks` in order, each fading in as a whole when it arrives; see
+/// [`MdContext::fade_in`].
+fn render_blocks(blocks: &[Block], ctx: &mut MdContext, window: &Window) -> Vec<AnyElement> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(ix, block)| ctx.fade_in(ix, |ctx| render_block(block, ctx, window)))
+        .collect()
 }
 
 /// Children one above the other, `gap` apart, in block layout. A flex column
@@ -365,25 +403,19 @@ pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyE
             text_element(runs, size, line, FontWeight::SEMIBOLD, ctx)
         }
         Block::CodeBlock { language, code } => render_code_block(language.as_deref(), code, ctx),
-        Block::BlockQuote { children } => stack(
-            children
-                .iter()
-                .map(|child| render_block(child, ctx, window))
-                .collect::<Vec<_>>(),
-            8.0,
-        )
-        // Accent-tinted quote: an indigo rail with a whisper of the same
-        // hue behind it.
-        .border_l_2()
-        .border_color(opacity(theme.accent, 0.6))
-        .bg(opacity(theme.accent, 0.05))
-        .rounded_tr(px(6.0))
-        .rounded_br(px(6.0))
-        .pl(px(12.0))
-        .pr(px(10.0))
-        .py(px(6.0))
-        .text_color(theme.text_muted)
-        .into_any_element(),
+        Block::BlockQuote { children } => stack(render_blocks(children, ctx, window), 8.0)
+            // Accent-tinted quote: an indigo rail with a whisper of the same
+            // hue behind it.
+            .border_l_2()
+            .border_color(opacity(theme.accent, 0.6))
+            .bg(opacity(theme.accent, 0.05))
+            .rounded_tr(px(6.0))
+            .rounded_br(px(6.0))
+            .pl(px(12.0))
+            .pr(px(10.0))
+            .py(px(6.0))
+            .text_color(theme.text_muted)
+            .into_any_element(),
         Block::List {
             ordered_start,
             items,
@@ -421,19 +453,17 @@ pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyE
                         )
                         .into_any_element(),
                 };
-                let children: Vec<AnyElement> = item
-                    .iter()
-                    .map(|child| render_block(child, ctx, window))
-                    .collect();
-                rows.push(
+                // An item added to a list already shown fades in on its own.
+                rows.push(ctx.fade_in(item_ix, |ctx| {
+                    let children = render_blocks(item, ctx, window);
                     div()
                         .flex()
                         .flex_row()
                         .gap(px(8.0))
                         .child(marker)
                         .child(stack(children, 4.0).flex_1().min_w_0())
-                        .into_any_element(),
-                );
+                        .into_any_element()
+                }));
             }
             stack(rows, 4.0).into_any_element()
         }
@@ -463,8 +493,11 @@ fn render_image(src: &str, alt: &str, ctx: &mut MdContext) -> AnyElement {
     let ix = ctx.next_image;
     ctx.next_image += 1;
     let element_id = ctx.element_id;
+    // Every state holds the one text piece the link fallback uses, so later
+    // pieces keep their keys, and their fades, when a load finishes or fails.
     match ctx.images.get(src).cloned() {
         Some(ImageLoad::Ready(resource, width, height)) if width > 0.0 && height > 0.0 => {
+            ctx.take_sub();
             let ratio = width / height;
             let target = match &resource {
                 Resource::Uri(uri) => uri.to_string(),
@@ -518,12 +551,15 @@ fn render_image(src: &str, alt: &str, ctx: &mut MdContext) -> AnyElement {
                 )
                 .into_any_element()
         }
-        Some(ImageLoad::Loading) => div()
-            .w_full()
-            .h(px(m.md_image_max_height.min(160.0)))
-            .rounded(px(m.md_code_radius))
-            .bg(ink(&theme, 0.035))
-            .into_any_element(),
+        Some(ImageLoad::Loading) => {
+            ctx.take_sub();
+            div()
+                .w_full()
+                .h(px(m.md_image_max_height.min(160.0)))
+                .rounded(px(m.md_code_radius))
+                .bg(ink(&theme, 0.035))
+                .into_any_element()
+        }
         _ => {
             let text = if alt.trim().is_empty() { src } else { alt };
             let link = InlineRun {

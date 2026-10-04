@@ -24,6 +24,9 @@ use crate::theme::Theme;
 pub const CODE_WRAP_TOGGLE: &str = "gpuix:toggle-code-wrap";
 /// `linkClick` prefix for a click on an image, followed by its resolved source.
 pub const IMAGE_OPEN: &str = "gpuix:open-image:";
+/// A gap between renders that means the element was out of view. A streaming
+/// document on screen renders far more often, with whatever shows its progress.
+const AWAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct MarkdownFactory;
 
@@ -49,7 +52,13 @@ pub struct MarkdownElement {
     code_wrap: bool,
     /// Set while the source is still arriving; see [`Veil`].
     streaming: bool,
+    /// Outlives `streaming` until the fades it started have finished.
     veil: Option<Veil>,
+    /// Streaming just stopped. The update that stops it often brings the last
+    /// block, which fades in like the ones before it.
+    ending: bool,
+    /// When this element last rendered.
+    painted: Option<web_time::Instant>,
     /// Folder that relative image paths resolve against.
     image_base: Option<std::path::PathBuf>,
 }
@@ -138,18 +147,33 @@ impl CustomElement for MarkdownElement {
             };
             md.images.insert(src, load);
         }
-        md.veil = if self.streaming {
-            Some(self.veil.take().unwrap_or_default())
-        } else {
-            None
-        };
+        // New blocks and text fade in while streaming and in the update that
+        // ends it; fades still running then finish rather than snap to full. Reduced
+        // motion shows everything at once, as GPUI's own animations do.
+        // Props only arrive when the element renders, so an end that came
+        // while a list had it scrolled out of view shows up late; that update
+        // shows at once, like the rest of a finished document.
+        let now = web_time::Instant::now();
+        let away = self
+            .painted
+            .replace(now)
+            .is_some_and(|at| now.duration_since(at) > AWAY);
+        let ending = std::mem::take(&mut self.ending) && !away;
+        let live = (self.streaming || ending) && !cx.reduce_motion();
+        md.veil = self.veil.take().or_else(|| live.then(Veil::default));
+        if let Some(veil) = &mut md.veil {
+            veil.live = live;
+        }
         let body = render_tree(&tree, &mut md, window);
         if let Some(mut veil) = md.veil.take() {
             veil.finish_frame();
-            if std::mem::take(&mut veil.animating) {
+            let animating = std::mem::take(&mut veil.animating);
+            if animating {
                 window.request_animation_frame();
             }
-            self.veil = Some(veil);
+            if live || animating {
+                self.veil = Some(veil);
+            }
         }
 
         // Block layout, like the document inside it; see `render::stack`.
@@ -178,11 +202,11 @@ impl CustomElement for MarkdownElement {
                     .filter(|base| !base.is_empty())
                     .map(Into::into)
             }
+            // The veil stays until `render` sees its fades finish.
             "streaming" => {
-                self.streaming = value.as_bool().unwrap_or(false);
-                if !self.streaming {
-                    self.veil = None;
-                }
+                let streaming = value.as_bool().unwrap_or(false);
+                self.ending |= self.streaming && !streaming;
+                self.streaming = streaming;
             }
             _ => {}
         }
