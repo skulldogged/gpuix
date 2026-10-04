@@ -5821,11 +5821,13 @@ pub(crate) fn build_host_container(
 
             // ── Mouse down (all buttons) ─────────────────────────
             "mouseDown" => {
-                // Wire all three buttons so JS gets right-click, middle-click, etc.
+                // Include navigation buttons so app history works over any element.
                 for &button in &[
                     gpui::MouseButton::Left,
                     gpui::MouseButton::Middle,
                     gpui::MouseButton::Right,
+                    gpui::MouseButton::Navigate(gpui::NavigationDirection::Back),
+                    gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward),
                 ] {
                     let callback = callback.clone();
                     el = el.on_mouse_down(button, move |mouse_event, _window, _cx| {
@@ -5847,6 +5849,8 @@ pub(crate) fn build_host_container(
                     gpui::MouseButton::Left,
                     gpui::MouseButton::Middle,
                     gpui::MouseButton::Right,
+                    gpui::MouseButton::Navigate(gpui::NavigationDirection::Back),
+                    gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward),
                 ] {
                     let callback = callback.clone();
                     el = el.on_mouse_up(button, move |mouse_event, _window, _cx| {
@@ -6530,13 +6534,15 @@ pub(crate) fn emit_file_drop(
     });
 }
 
-/// Convert GPUI MouseButton to our u32 encoding: 0=left, 1=middle, 2=right.
+/// Convert GPUI MouseButton to our u32 encoding: 0=left, 1=middle, 2=right,
+/// 3=back, 4=forward.
 pub(crate) fn mouse_button_to_u32(button: gpui::MouseButton) -> u32 {
     match button {
         gpui::MouseButton::Left => 0,
         gpui::MouseButton::Middle => 1,
         gpui::MouseButton::Right => 2,
-        gpui::MouseButton::Navigate(_) => 3,
+        gpui::MouseButton::Navigate(gpui::NavigationDirection::Back) => 3,
+        gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward) => 4,
     }
 }
 

@@ -490,7 +490,7 @@ export interface EventPayload {
   /** Mouse Y position in window coordinates (pixels). */
   y?: number
   /**
-   * Which mouse button: 0=left, 1=middle, 2=right.
+   * Which mouse button: 0=left, 1=middle, 2=right, 3=back, 4=forward.
    * Populated for: mouseDown, mouseUp, click, mouseDownOutside, contextMenu.
    */
   button?: number
