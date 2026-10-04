@@ -182,6 +182,14 @@ impl AnchoredElement {
     fn wrap_at_trigger(&self, layer: gpui::AnyElement) -> gpui::AnyElement {
         use gpui::prelude::*;
 
+        // `anchored` lays out at its content's size, so centring it directly
+        // would centre the box and then the centre anchor would shift it by
+        // half again. Centre a zero-size point instead and anchor to that.
+        let layer = if matches!(self.align, Alignment::Center) {
+            gpui::div().size_0().child(layer).into_any_element()
+        } else {
+            layer
+        };
         match (self.side, self.align) {
             (Side::Top, Alignment::Start) => gpui::div()
                 .absolute()
