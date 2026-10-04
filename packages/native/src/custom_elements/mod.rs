@@ -338,7 +338,18 @@ impl CustomElementEntry {
 /// Stores factories (one per type) and live adapters (one per element ID).
 pub struct CustomElementRegistry {
     factories: HashMap<String, Box<dyn CustomElementFactory>>,
-    instances: HashMap<u64, CustomElementEntry>,
+    // Every `<div>` built checks it, so a fast hash.
+    instances: rustc_hash::FxHashMap<u64, CustomElementEntry>,
+    synced: rustc_hash::FxHashMap<u64, Synced>,
+}
+
+/// What an instance was last synced from, so an unchanged element skips
+/// comparing its props on every frame.
+#[derive(Default)]
+struct Synced {
+    revision: Option<u64>,
+    /// The element's listeners that its type emits.
+    events: HashSet<String>,
 }
 
 impl CustomElementRegistry {
@@ -352,7 +363,8 @@ impl CustomElementRegistry {
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),
-            instances: HashMap::new(),
+            instances: Default::default(),
+            synced: Default::default(),
         }
     }
 
@@ -400,31 +412,40 @@ impl CustomElementRegistry {
     }
 
     /// Synchronize one retained frame into an adapter and render it.
+    ///
+    /// `revision` is the element's subtree revision, which moves whenever its
+    /// props or listeners change, so an unchanged element skips comparing them.
     pub fn render(
         &mut self,
         element_type: &str,
         props: &HashMap<String, serde_json::Value>,
+        revision: u64,
         ctx: CustomRenderContext,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<crate::renderer::GpuixView>,
     ) -> gpui::AnyElement {
         use gpui::IntoElement;
 
-        let Some(entry) = self.get_or_create(ctx.id, element_type) else {
+        let id = ctx.id;
+        if self.get_or_create(id, element_type).is_none() {
             log::warn!("Unknown element type: {element_type}");
             return gpui::Empty.into_any_element();
-        };
-
-        entry.sync(props);
-        let supported = entry.element.supported_events();
-        let filtered: HashSet<String> = ctx
-            .events
-            .iter()
-            .filter(|event| supported.contains(&event.as_str()))
-            .cloned()
-            .collect();
+        }
+        let entry = self.instances.get_mut(&id).expect("created above");
+        let synced = self.synced.entry(id).or_default();
+        if synced.revision != Some(revision) {
+            synced.revision = Some(revision);
+            entry.sync(props);
+            let supported = entry.element.supported_events();
+            synced.events = ctx
+                .events
+                .iter()
+                .filter(|event| supported.contains(&event.as_str()))
+                .cloned()
+                .collect();
+        }
         let ctx = CustomRenderContext {
-            events: &filtered,
+            events: &synced.events,
             ..ctx
         };
         entry.element.render(ctx, window, cx)
@@ -445,6 +466,7 @@ impl CustomElementRegistry {
     /// Called when React destroys an element.
     pub fn destroy(&mut self, id: u64) {
         if let Some(mut entry) = self.instances.remove(&id) {
+            self.synced.remove(&id);
             entry.element.destroy();
         }
     }
@@ -468,6 +490,7 @@ impl CustomElementRegistry {
 
     fn destroy_live_image(&mut self, id: u64, window: &mut gpui::Window) {
         if let Some(mut entry) = self.instances.remove(&id) {
+            self.synced.remove(&id);
             if let Some(image) = entry
                 .element
                 .live_image()

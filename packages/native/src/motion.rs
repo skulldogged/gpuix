@@ -295,11 +295,12 @@ impl MotionState {
         self.valid.then(|| self.sample(now).0)
     }
 
-    fn sample(&self, now: Instant) -> (MotionStyle, bool) {
-        let delay = seconds(self.transition.delay);
-        let duration = seconds(self.transition.duration);
-        let elapsed = now.saturating_duration_since(self.started);
-        let raw = if duration.is_zero() {
+    /// Linear progress through the transition, 1 or more once it has finished.
+    fn raw_progress(&self, now: Instant) -> f64 {
+        let delay = self.transition.delay;
+        let duration = self.transition.duration;
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64();
+        if duration == 0.0 {
             if elapsed < delay {
                 0.0
             } else {
@@ -308,19 +309,24 @@ impl MotionState {
         } else if elapsed <= delay {
             0.0
         } else {
-            elapsed.saturating_sub(delay).as_secs_f64() / duration.as_secs_f64()
-        };
-        let active = self.from != self.target && raw < 1.0;
-        let progress = ease(raw.clamp(0.0, 1.0), &self.transition.ease);
+            (elapsed - delay) / duration
+        }
+    }
+
+    fn sample(&self, now: Instant) -> (MotionStyle, bool) {
+        let raw = self.raw_progress(now);
+        // Every element that ever animated is sampled on every frame it
+        // builds, long after it finished, so skip the easing curve then.
+        if raw >= 1.0 {
+            return (self.target, false);
+        }
+        let active = self.from != self.target;
+        let progress = ease(raw.max(0.0), &self.transition.ease);
         (self.from.interpolate(self.target, progress), active)
     }
 
     pub(crate) fn frame(&mut self, now: Instant) -> MotionFrame {
-        let (_, active) = if self.valid {
-            self.sample(now)
-        } else {
-            (MotionStyle::default(), false)
-        };
+        let active = self.valid && self.from != self.target && self.raw_progress(now) < 1.0;
         if active {
             self.needs_settle = true;
         }
@@ -429,10 +435,6 @@ fn validate_ease(ease: &MotionEase) -> Result<(), String> {
     Ok(())
 }
 
-fn seconds(value: f64) -> Duration {
-    Duration::try_from_secs_f64(value).expect("motion durations are validated when parsed")
-}
-
 fn ease(progress: f64, ease: &MotionEase) -> f64 {
     let curve = match ease {
         MotionEase::CubicBezier(curve) => *curve,
@@ -482,7 +484,8 @@ struct HoverTrack {
 }
 
 thread_local! {
-    static HOVERS: std::cell::RefCell<std::collections::HashMap<u64, HoverTrack>> =
+    // Looked up for every element on every frame, so a fast hash.
+    static HOVERS: std::cell::RefCell<rustc_hash::FxHashMap<u64, HoverTrack>> =
         Default::default();
 }
 

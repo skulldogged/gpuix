@@ -19,7 +19,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, quad, size, BorderStyle, Bounds, CursorStyle, Hitbox,
+    canvas, point, prelude::*, px, quad, size, BorderStyle, Bounds, CursorStyle, Hitbox,
     HitboxBehavior, Hsla, SharedString, StyledText, TextLayout, TextRun, Window,
 };
 
@@ -163,14 +163,95 @@ pub fn chrome_text(text: SharedString, runs: Option<Vec<TextRun>>) -> gpui::AnyE
         Some(runs) => StyledText::new(text.clone()).with_runs(runs),
         None => StyledText::new(text.clone()),
     };
-    let log = canvas(
-        |_, _, _| (),
-        move |_, _, _, _| PAINTED.with(|p| p.borrow_mut().push(text.clone())),
-    )
-    .absolute()
-    .w(px(0.0))
-    .h(px(0.0));
-    div().relative().child(log).child(styled).into_any_element()
+    Underlaid {
+        text: styled,
+        hitbox: false,
+        underlay: Some(Box::new(
+            move |_: Option<&Hitbox>, _: &mut Window, _: &mut gpui::App| {
+                PAINTED.with(|p| p.borrow_mut().push(text))
+            },
+        )),
+    }
+    .into_any_element()
+}
+
+/// `StyledText` that runs `underlay` just before painting its glyphs, with a
+/// `Normal` hitbox over the text when `hitbox` is set. It stands in for a
+/// `relative` div holding an absolute canvas beside the text, which every run
+/// of text used to be: three layout nodes and two more elements, for every run,
+/// on every frame. The canvas filled the div, which the text alone sized, so
+/// the text's own bounds are the same box.
+struct Underlaid {
+    text: StyledText,
+    hitbox: bool,
+    underlay: Option<Box<dyn FnOnce(Option<&Hitbox>, &mut Window, &mut gpui::App)>>,
+}
+
+impl gpui::Element for Underlaid {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        self.text.request_layout(id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        state: &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Option<Hitbox> {
+        // A `Normal` hitbox blocks nothing behind it; it only lets the text
+        // ask for a cursor.
+        let hitbox = self
+            .hitbox
+            .then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal));
+        self.text
+            .prepaint(id, inspector_id, bounds, state, window, cx);
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        state: &mut (),
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        if let Some(underlay) = self.underlay.take() {
+            underlay(hitbox.as_ref(), window, cx);
+        }
+        self.text
+            .paint(id, inspector_id, bounds, state, &mut (), window, cx);
+    }
+}
+
+impl IntoElement for Underlaid {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 /// Selection key for an element. `sub` distinguishes multiple text runs painted
@@ -274,15 +355,9 @@ pub fn selectable_text(opts: SelectableText) -> gpui::AnyElement {
     let layout = styled.layout().clone();
     let clickable = on_link.is_some() && !links.is_empty();
 
-    let underlay = canvas(
-        // A `Normal` hitbox blocks nothing behind it; it only lets the text
-        // ask for a cursor.
-        move |bounds, window, _| {
-            (selectable || clickable)
-                .then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal))
-        },
-        move |_, hitbox, window, _| {
-            if let Some(hitbox) = &hitbox {
+    let underlay = Box::new(
+        move |hitbox: Option<&Hitbox>, window: &mut Window, _: &mut gpui::App| {
+            if let Some(hitbox) = hitbox {
                 register_text_cursor(window, hitbox, &layout, selectable, &links, clickable);
             }
             if let Some(paint) = &extra_wash {
@@ -330,15 +405,14 @@ pub fn selectable_text(opts: SelectableText) -> gpui::AnyElement {
                 register_link_listener(window, &layout, &links, on_link, &selection);
             }
         },
-    )
-    .absolute()
-    .size_full();
+    );
 
-    div()
-        .relative()
-        .child(underlay)
-        .child(styled)
-        .into_any_element()
+    Underlaid {
+        text: styled,
+        hitbox: selectable || clickable,
+        underlay: Some(underlay),
+    }
+    .into_any_element()
 }
 
 /// The cursor a run asks for at `position`: a hand over a clickable link, an

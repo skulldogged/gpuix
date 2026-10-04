@@ -11,6 +11,12 @@ use napi::bindgen_prelude::*;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use napi_derive::napi;
 
+// Every frame builds and drops thousands of elements, and the Windows heap
+// took about 7% of a scrolling frame.
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod accessibility;
 #[cfg(target_os = "macos")]
 mod app_menu;

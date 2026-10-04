@@ -211,6 +211,12 @@ impl RetainedTree {
             .insert(id, RetainedElement::new(id, element_type, revision));
     }
 
+    /// Moves whenever the tree changes, so per-frame bookkeeping that depends
+    /// only on the tree can skip frames in which nothing changed.
+    pub fn generation(&self) -> u64 {
+        self.next_revision
+    }
+
     fn take_revision(&mut self) -> u64 {
         let revision = self.next_revision;
         self.next_revision = self.next_revision.wrapping_add(1).max(1);
@@ -363,12 +369,18 @@ impl RetainedTree {
     }
 
     pub fn set_event_listener(&mut self, id: u64, event_type: String, has_handler: bool) {
+        let mut changed = false;
         if let Some(element) = self.elements.get_mut(&id) {
-            if has_handler {
-                element.events.insert(event_type);
+            changed = if has_handler {
+                element.events.insert(event_type)
             } else {
-                element.events.remove(&event_type);
-            }
+                element.events.remove(&event_type)
+            };
+        }
+        // Listeners attach as elements build, so a cached region has to build
+        // again to gain or lose one.
+        if changed {
+            self.mark_render_changed(id);
         }
     }
 
@@ -391,6 +403,7 @@ impl RetainedTree {
             // the custom-prop map that only custom elements read.
             if key == "autoFocus" {
                 element.auto_focus = value.as_bool().unwrap_or(false);
+                self.take_revision();
                 return;
             }
             if key == "testId" {

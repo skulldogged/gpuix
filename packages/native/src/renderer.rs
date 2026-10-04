@@ -3401,6 +3401,9 @@ pub(crate) struct GpuixView {
     pub(crate) tree: Arc<Mutex<RetainedTree>>,
     pub(crate) event_callback: Option<EventCallback>,
     pub(crate) window_title: String,
+    /// The title last given to the window. Setting it is a system call that
+    /// took 4% of a frame when it ran on every one.
+    applied_window_title: Option<String>,
     pub(crate) window_key_down: bool,
     pub(crate) window_key_up: bool,
     pub(crate) window_key_event_id: u64,
@@ -3424,9 +3427,14 @@ pub(crate) struct GpuixView {
     /// Handles persist across renders so GPUI maintains scroll offset state.
     pub(crate) scroll_handles: HashMap<u64, gpui::ScrollHandle>,
     /// Native animation clocks keyed by retained element ID.
-    pub(crate) motion_states: HashMap<u64, crate::motion::MotionState>,
+    pub(crate) motion_states: rustc_hash::FxHashMap<u64, crate::motion::MotionState>,
     /// The revision each motion element's state was last synced at.
-    motion_revisions: HashMap<u64, u64>,
+    motion_revisions: rustc_hash::FxHashMap<u64, u64>,
+    /// The tree generation motion states were last synced at.
+    motion_synced: Option<u64>,
+    /// The tree generation focus handles and per-element maps were last
+    /// reconciled with.
+    tree_synced: Option<u64>,
     /// Live text selection, shared with the paint closures and the napi methods.
     pub(crate) selection: SharedSelection,
     /// Persistent measurement and scroll state for React-backed virtual lists.
@@ -3529,12 +3537,10 @@ fn emit_motion_settled(
 
 fn sync_motion_states(
     tree: &crate::retained_tree::RetainedTree,
-    states: &mut HashMap<u64, crate::motion::MotionState>,
-    revisions: &mut HashMap<u64, u64>,
+    states: &mut rustc_hash::FxHashMap<u64, crate::motion::MotionState>,
+    revisions: &mut rustc_hash::FxHashMap<u64, u64>,
     now: web_time::Instant,
 ) -> (bool, Vec<(u64, u64)>, HashSet<u64>) {
-    states.retain(|id, _| tree.motion_ids.contains(id));
-    revisions.retain(|id, _| states.contains_key(id));
     let mut active = false;
     let mut settled = Vec::new();
     let mut animating = HashSet::new();
@@ -3763,6 +3769,7 @@ impl GpuixView {
             tree,
             event_callback,
             window_title,
+            applied_window_title: None,
             window_key_down: false,
             window_key_up: false,
             window_key_event_id: 0,
@@ -3774,8 +3781,10 @@ impl GpuixView {
             focus_subscriptions: HashMap::new(),
             custom_registry: CustomElementRegistry::with_defaults(),
             scroll_handles: HashMap::new(),
-            motion_states: HashMap::new(),
-            motion_revisions: HashMap::new(),
+            motion_states: Default::default(),
+            motion_revisions: Default::default(),
+            motion_synced: None,
+            tree_synced: None,
             selection,
             virtual_lists: HashMap::new(),
             selection_drag_position: None,
@@ -4009,12 +4018,22 @@ impl GpuixView {
 
         let callback = self.event_callback.clone();
         let now = self.clock.now();
-        let (motion_active, motion_settled, _) = sync_motion_states(
-            &tree,
-            &mut self.motion_states,
-            &mut self.motion_revisions,
-            now,
-        );
+        // Rows build after the root in the same frame, so they only need to
+        // sync if the Node thread changed the tree in between. The root's sync
+        // already asked for the next frame of anything animating.
+        let generation = tree.generation();
+        let (motion_active, motion_settled) = if self.motion_synced == Some(generation) {
+            (false, Vec::new())
+        } else {
+            self.motion_synced = Some(generation);
+            let (active, settled, _) = sync_motion_states(
+                &tree,
+                &mut self.motion_states,
+                &mut self.motion_revisions,
+                now,
+            );
+            (active, settled)
+        };
         let mut highlight_events = Vec::new();
 
         // Re-resolve against the tree as it is NOW. gpui calls this during
@@ -4177,7 +4196,7 @@ pub(crate) struct BuildCtx<'a> {
     pub scroll_handles: &'a mut HashMap<u64, gpui::ScrollHandle>,
     pub custom_registry: &'a mut CustomElementRegistry,
     virtual_lists: &'a mut HashMap<u64, VirtualListEntry>,
-    pub motion_states: &'a mut HashMap<u64, crate::motion::MotionState>,
+    pub motion_states: &'a mut rustc_hash::FxHashMap<u64, crate::motion::MotionState>,
     pub now: web_time::Instant,
     pub selection: SharedSelection,
     /// Inherited text state, resolved the way CSS inherits it. The renderer's
@@ -4875,17 +4894,6 @@ impl GpuixView {
             }
         }
 
-        // Keep the request until the handle exists. A frame can render before
-        // the batch that creates the element arrives (Solid flushes in a
-        // microtask, Windows and Linux render on their own thread).
-        if let Some(handle) = self
-            .pending_focus_element
-            .and_then(|pending| self.focus_handles.get(&pending.id).cloned())
-        {
-            handle.focus(window, cx);
-            self.pending_focus_element = None;
-        }
-
         self.focus_subscriptions.retain(|(id, event), _| {
             tree.elements
                 .get(id)
@@ -4948,7 +4956,10 @@ impl gpui::Render for GpuixView {
     ) -> impl gpui::IntoElement {
         use gpui::IntoElement;
 
-        window.set_window_title(&self.window_title);
+        if self.applied_window_title.as_ref() != Some(&self.window_title) {
+            window.set_window_title(&self.window_title);
+            self.applied_window_title = Some(self.window_title.clone());
+        }
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if let Some(id) = PENDING_FOCUS_ELEMENT.with(|pending| pending.borrow_mut().take()) {
@@ -4960,27 +4971,49 @@ impl gpui::Render for GpuixView {
         let tree = tree_arc.lock().unwrap();
         let callback = self.event_callback.clone();
 
-        // Sync focus handles before building elements.
-        self.sync_focus_handles(&tree, &callback, window, cx);
+        // Each of these walks the whole tree, and depends on nothing else, so
+        // frames that only scroll or animate skip them.
+        let generation = tree.generation();
+        if self.tree_synced != Some(generation) {
+            self.tree_synced = Some(generation);
 
-        // Ensure custom element instances are destroyed when their IDs disappear.
-        self.custom_registry
-            .prune_missing(|id| tree.elements.contains_key(&id), window);
+            // Sync focus handles before building elements.
+            self.sync_focus_handles(&tree, &callback, window, cx);
 
-        // Clean up scroll handles for destroyed elements (IDs removed from tree).
-        // Scrollability-based cleanup (element still exists but style changed
-        // from scroll to non-scroll) is handled inside build_host_container().
-        self.scroll_handles
-            .retain(|id, _| tree.elements.contains_key(id));
-        self.virtual_lists
-            .retain(|id, _| tree.elements.contains_key(id));
-        self.regions.retain(|id, region| {
-            let keep = tree.elements.contains_key(id);
-            if !keep {
-                crate::automation::forget_view(region.view.entity_id());
-            }
-            keep
-        });
+            // Ensure custom element instances are destroyed when their IDs disappear.
+            self.custom_registry
+                .prune_missing(|id| tree.elements.contains_key(&id), window);
+
+            // Clean up scroll handles for destroyed elements (IDs removed from tree).
+            // Scrollability-based cleanup (element still exists but style changed
+            // from scroll to non-scroll) is handled inside build_host_container().
+            self.scroll_handles
+                .retain(|id, _| tree.elements.contains_key(id));
+            self.motion_states
+                .retain(|id, _| tree.motion_ids.contains(id));
+            let motion_states = &self.motion_states;
+            self.motion_revisions
+                .retain(|id, _| motion_states.contains_key(id));
+            self.virtual_lists
+                .retain(|id, _| tree.elements.contains_key(id));
+            self.regions.retain(|id, region| {
+                let keep = tree.elements.contains_key(id);
+                if !keep {
+                    crate::automation::forget_view(region.view.entity_id());
+                }
+                keep
+            });
+        }
+        // Keep the request until the handle exists. A frame can render before
+        // the batch that creates the element arrives (Solid flushes in a
+        // microtask, Windows and Linux render on their own thread).
+        if let Some(handle) = self
+            .pending_focus_element
+            .and_then(|pending| self.focus_handles.get(&pending.id).cloned())
+        {
+            handle.focus(window, cx);
+            self.pending_focus_element = None;
+        }
         let root_view = cx.entity_id();
         crate::automation::begin_view(root_view, true);
         // Build the element tree. custom_registry, focus_handles, and scroll_handles
@@ -4993,6 +5026,7 @@ impl gpui::Render for GpuixView {
             &mut self.motion_revisions,
             now,
         );
+        self.motion_synced = Some(generation);
         self.active_motions = animating;
         // Pruned by DECLARATION, not existence: an element that drops its
         // `highlight` prop keeps living, and its cached group list holds a copy
@@ -5225,8 +5259,14 @@ pub(crate) fn build_element(
                     .is_some_and(crate::motion::hover_is_animatable),
                 view: ctx.view,
             };
-            ctx.custom_registry
-                .render(custom_type, &element.custom_props, render_ctx, window, cx)
+            ctx.custom_registry.render(
+                custom_type,
+                &element.custom_props,
+                element.subtree_revision,
+                render_ctx,
+                window,
+                cx,
+            )
         }
     };
 
@@ -6052,6 +6092,25 @@ where
 }
 
 pub(crate) fn apply_styles<E: gpui::Styled>(mut el: E, style: &StyleDesc) -> E {
+    apply_style_fields(StyleSink(el.style()), style);
+    el
+}
+
+/// `Styled` over a borrowed refinement. Every `Styled` method takes and returns
+/// `self`, so on an element each call moved the whole element, a few KB with
+/// its listeners, and styling makes dozens of calls for every element on every
+/// frame. Here a call moves one pointer.
+struct StyleSink<'a>(&'a mut gpui::StyleRefinement);
+
+impl gpui::Styled for StyleSink<'_> {
+    fn style(&mut self) -> &mut gpui::StyleRefinement {
+        self.0
+    }
+}
+
+fn apply_style_fields<'a>(mut el: StyleSink<'a>, style: &StyleDesc) -> StyleSink<'a> {
+    use gpui::Styled as _;
+
     match style.display.as_deref() {
         Some("flex") => el = el.flex(),
         Some("grid") => el = el.grid(),

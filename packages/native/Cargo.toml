@@ -89,6 +89,7 @@ gpui_macos = { path = "../../zed/crates/gpui_macos", default-features = false, f
 # awareness is set at runtime in renderer.rs instead of via windows-manifest.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_HiDpi"] }
+mimalloc = { version = "0.1.52", default-features = false }
 
 [features]
 # test-support is default so published binaries include TestGpuixRenderer,

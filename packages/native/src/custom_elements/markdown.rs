@@ -44,11 +44,10 @@ impl CustomElementFactory for MarkdownFactory {
 pub struct MarkdownElement {
     source: String,
     theme: Theme,
-    /// Parsed tree for the current source. `Rc` so a frame clones a pointer
-    /// rather than every block, string and inline run in the document.
+    /// Parsed tree for the current source, dropped when the source changes.
+    /// `Rc` so a frame clones a pointer rather than every block, string and
+    /// inline run in the document.
     tree: Option<Rc<BlockTree>>,
-    parsed_len: Option<usize>,
-    parsed_hash: Option<u64>,
     code_wrap: bool,
     /// Set while the source is still arriving; see [`Veil`].
     streaming: bool,
@@ -65,22 +64,11 @@ pub struct MarkdownElement {
 
 impl MarkdownElement {
     fn tree(&mut self) -> Rc<BlockTree> {
-        let hash = hash64(&self.source);
-        let stale = self.parsed_hash != Some(hash) || self.parsed_len != Some(self.source.len());
-        if stale || self.tree.is_none() {
+        if self.tree.is_none() {
             self.tree = Some(Rc::new(parse(&self.source)));
-            self.parsed_hash = Some(hash);
-            self.parsed_len = Some(self.source.len());
         }
         self.tree.clone().expect("just parsed")
     }
-}
-
-fn hash64(source: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    hasher.finish()
 }
 
 impl CustomElement for MarkdownElement {
@@ -193,7 +181,13 @@ impl CustomElement for MarkdownElement {
 
     fn set_prop(&mut self, key: &str, value: serde_json::Value) {
         match key {
-            "source" => self.source = value.as_str().unwrap_or("").to_string(),
+            "source" => {
+                let source = value.as_str().unwrap_or("");
+                if source != self.source {
+                    self.source = source.to_string();
+                    self.tree = None;
+                }
+            }
             "theme" => self.theme = Theme::from_prop(Some(&value)),
             "codeWrap" => self.code_wrap = value.as_bool().unwrap_or(false),
             "imageBase" => {

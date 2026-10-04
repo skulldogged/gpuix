@@ -51,9 +51,10 @@ thread_local! {
 #[derive(Default)]
 struct BoundsRegistry {
     root: Option<gpui::EntityId>,
-    by_view: HashMap<gpui::EntityId, HashMap<u64, ElementBounds>>,
+    // Every element's paint writes both, so fast hashes.
+    by_view: rustc_hash::FxHashMap<gpui::EntityId, rustc_hash::FxHashMap<u64, ElementBounds>>,
     /// The view each element was last painted in.
-    owner: HashMap<u64, gpui::EntityId>,
+    owner: rustc_hash::FxHashMap<u64, gpui::EntityId>,
     /// The regions each view built when it last rendered, and back again.
     children: HashMap<gpui::EntityId, Vec<gpui::EntityId>>,
     parent: HashMap<gpui::EntityId, gpui::EntityId>,
