@@ -1218,7 +1218,9 @@ impl GpuixRenderer {
         // Last window close quits AppKit; tick() returns false and JS exits.
         let app = gpui::Application::with_platform(platform.clone())
             .with_quit_mode(gpui::QuitMode::LastWindowClosed);
+        let fonts = options.fonts.clone().unwrap_or_default();
         let app_handle = app.run_embedded(move |cx: &mut gpui::App| {
+            crate::window_state::init(cx, &fonts);
             crate::custom_elements::input::init(cx);
             crate::custom_elements::img::init(cx);
             // After the other bindings: `set_menus` reads key equivalents out of
@@ -1352,6 +1354,10 @@ impl GpuixRenderer {
                     gpui_platform::application()
                         .with_quit_mode(gpui::QuitMode::LastWindowClosed)
                         .run(move |cx| {
+                            crate::window_state::init(
+                                cx,
+                                window_options.fonts.as_deref().unwrap_or_default(),
+                            );
                             crate::custom_elements::input::init(cx);
                             crate::custom_elements::img::init(cx);
                             let size = gpui::size(gpui::px(width as f32), gpui::px(height as f32));
@@ -1383,8 +1389,15 @@ impl GpuixRenderer {
                                 }
                             };
 
-                            cx.spawn(async move |cx| {
+                            let mut commands = Some(cx.spawn(async move |cx| {
                                 run_ui_commands(command_receiver, window, cx).await;
+                            }));
+                            cx.on_window_closed(move |_, id| {
+                                if id == window.window_id() {
+                                    // Cancel the receiver before the platform
+                                    // dispatcher is destroyed.
+                                    commands.take();
+                                }
                             })
                             .detach();
                             if activate {
@@ -1545,6 +1558,14 @@ impl GpuixRenderer {
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
         ))
+    }
+
+    /// Maximized, fullscreen, active and dark, plus the size, as of the last
+    /// frame. Never waits on the window, so it is safe to poll and still
+    /// answers after the window closed.
+    #[napi]
+    pub fn get_window_state(&self) -> crate::window_state::WindowState {
+        crate::window_state::get()
     }
 
     #[napi]
@@ -5019,6 +5040,7 @@ impl gpui::Render for GpuixView {
             window.set_window_title(&self.window_title);
             self.applied_window_title = Some(self.window_title.clone());
         }
+        crate::window_state::update(window, cx);
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if let Some(id) = PENDING_FOCUS_ELEMENT.with(|pending| pending.borrow_mut().take()) {
@@ -7257,6 +7279,12 @@ pub struct WindowOptions {
     pub transparent: Option<bool>,
     /// Hide the native titlebar so the app can draw chrome under the traffic lights.
     pub titlebar_transparent: Option<bool>,
+    /// Let the app draw the whole window, title bar included. Mark its regions
+    /// with `<gpuix-caption>` so dragging and the caption buttons stay native.
+    pub client_decorations: Option<bool>,
+    /// Font files to load before the window opens, so styles can name their
+    /// families without the fonts being installed.
+    pub fonts: Option<Vec<String>>,
     /// `"opaque"` | `"transparent"` | `"blurred"`. `transparent: true` is the
     /// same as `"transparent"` when this is unset.
     pub window_background: Option<String>,
@@ -7290,6 +7318,8 @@ impl Default for WindowOptions {
             fullscreen: Some(false),
             transparent: Some(false),
             titlebar_transparent: Some(false),
+            client_decorations: Some(false),
+            fonts: None,
             window_background: None,
             traffic_light_x: None,
             traffic_light_y: None,
@@ -7389,6 +7419,10 @@ fn to_gpui_window_options(
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut gpui_options = gpui::WindowOptions {
         window_bounds: Some(window_bounds),
+        window_decorations: options
+            .client_decorations
+            .unwrap_or(false)
+            .then_some(gpui::WindowDecorations::Client),
         titlebar: Some(gpui::TitlebarOptions {
             title: Some(title.into()),
             appears_transparent: titlebar_transparent,

@@ -9,6 +9,9 @@ license-file = "LICENSE"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Its own workspace, so the crate builds inside an application's repository.
+[workspace]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -88,7 +91,9 @@ gpui_macos = { path = "../../zed/crates/gpui_macos", default-features = false, f
 # Same crate GPUI uses. A .node cannot ship an exe manifest, so Windows DPI
 # awareness is set at runtime in renderer.rs instead of via windows-manifest.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_HiDpi"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+# `<gpuix-caption>` restores a maximized window through its HWND.
+raw-window-handle = "0.6"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [features]
