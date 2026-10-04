@@ -75,9 +75,29 @@ const CARET_WIDTH: Pixels = px(2.0);
 const DRAG_SCROLL_FRAME_MS: u64 = 16;
 const UNDO_COALESCE: Duration = Duration::from_millis(700);
 const UNDO_LIMIT: usize = 200;
+// A secure input paints one of these per grapheme, so each caret step
+// crosses one.
+const SECURE_MASK: &str = "\u{2022}";
 
 fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+}
+
+// Whether a key event would reveal a character typed into a secure input.
+// Windows reports AltGr as ctrl-alt, and AltGr types. Its key-up events carry
+// no `key_char`, so the key name decides too: typing keys are one character,
+// named keys ("enter", "left") are words.
+fn keystroke_types_text(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.platform || (modifiers.control && !modifiers.alt) {
+        return false;
+    }
+    keystroke
+        .key_char
+        .as_deref()
+        .is_some_and(|text| !text.chars().any(char::is_control))
+        || keystroke.key.chars().count() == 1
+        || keystroke.key == "space"
 }
 
 fn clipboard_text(item: ClipboardItem) -> Option<String> {
@@ -312,6 +332,7 @@ struct TextEditorElement {
     value: String,
     placeholder: String,
     read_only: bool,
+    secure: bool,
     min_rows: usize,
     max_rows: usize,
     last_prop_value: Option<String>,
@@ -326,6 +347,7 @@ impl TextEditorElement {
             value: String::new(),
             placeholder: String::new(),
             read_only: false,
+            secure: false,
             min_rows: 1,
             max_rows: if multiline { 10 } else { 1 },
             last_prop_value: None,
@@ -359,6 +381,7 @@ impl CustomElement for TextEditorElement {
                 let placeholder = self.placeholder.clone();
                 let multiline = self.multiline;
                 let read_only = self.read_only;
+                let secure = self.secure;
                 let min_rows = self.min_rows;
                 let max_rows = self.max_rows;
                 let caret_color = self.theme.caret;
@@ -378,6 +401,7 @@ impl CustomElement for TextEditorElement {
                     placeholder: placeholder.into(),
                     multiline,
                     read_only,
+                    secure,
                     min_rows,
                     max_rows,
                     selected_range: cursor..cursor,
@@ -421,6 +445,9 @@ impl CustomElement for TextEditorElement {
             state.emits_key_up = emits_key_up;
             state.placeholder = self.placeholder.clone().into();
             state.read_only = self.read_only;
+            if state.secure != self.secure {
+                state.set_secure(self.secure, cx);
+            }
             state.min_rows = self.min_rows.max(1);
             state.max_rows = self.max_rows.max(state.min_rows);
             if state.caret_color != self.theme.caret {
@@ -465,13 +492,16 @@ impl CustomElement for TextEditorElement {
         {
             editor = editor.relative();
         }
-        let default_role = if self.multiline {
+        let default_role = if self.secure {
+            gpui::Role::PasswordInput
+        } else if self.multiline {
             gpui::Role::MultilineTextInput
         } else {
             gpui::Role::TextInput
         };
         editor = crate::accessibility::apply_accessibility(editor, ctx.props, Some(default_role));
-        if ctx.props.get("aria-valuetext").is_none() && !self.value.is_empty() {
+        // AccessKit passes the value through as is, even for a password role.
+        if !self.secure && ctx.props.get("aria-valuetext").is_none() && !self.value.is_empty() {
             editor = editor.aria_value(self.value.clone());
         }
         if !self.placeholder.is_empty() {
@@ -520,6 +550,8 @@ impl CustomElement for TextEditorElement {
             "value" => self.value = value.as_str().unwrap_or_default().to_string(),
             "placeholder" => self.placeholder = value.as_str().unwrap_or_default().to_string(),
             "readOnly" => self.read_only = value.as_bool().unwrap_or(false),
+            // As in HTML, only a single-line input can be a password field.
+            "secure" => self.secure = value.as_bool().unwrap_or(false) && !self.multiline,
             "minRows" => self.min_rows = value.as_u64().unwrap_or(1) as usize,
             "maxRows" => {
                 self.max_rows = value
@@ -537,6 +569,7 @@ impl CustomElement for TextEditorElement {
             "value",
             "placeholder",
             "readOnly",
+            "secure",
             "minRows",
             "maxRows",
             "theme",
@@ -646,6 +679,7 @@ struct TextEditorState {
     placeholder: SharedString,
     multiline: bool,
     read_only: bool,
+    secure: bool,
     min_rows: usize,
     max_rows: usize,
     selected_range: Range<usize>,
@@ -739,6 +773,19 @@ impl TextEditorState {
         cx.notify();
     }
 
+    fn set_secure(&mut self, secure: bool, cx: &mut Context<Self>) {
+        self.secure = secure;
+        if secure {
+            // All of these hold copies of text typed before the field was secure.
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.last_edit = None;
+            self.pending_values.clear();
+            self.marked_range = None;
+        }
+        cx.notify();
+    }
+
     fn emit_change(&mut self) {
         if self.emits_change {
             self.pending_values.push_back(self.content.clone());
@@ -772,6 +819,10 @@ impl TextEditorState {
     }
 
     fn record_edit(&mut self, range: &Range<usize>, new_text: &str, now: Instant) {
+        // Snapshots would keep plaintext copies of a secret.
+        if self.secure {
+            return;
+        }
         let current = coalescing_edit(range, new_text, self.selection_reversed);
         let mergeable = self.last_edit.is_some_and(|previous| {
             edits_coalesce(
@@ -837,7 +888,12 @@ impl TextEditorState {
             .unwrap_or(self.content.len())
     }
 
+    // A secure value is one word, so word movement doesn't show where its
+    // spaces and punctuation are.
     fn previous_word_boundary(&self, offset: usize) -> usize {
+        if self.secure {
+            return 0;
+        }
         self.content
             .split_word_bound_indices()
             .rev()
@@ -846,6 +902,9 @@ impl TextEditorState {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
+        if self.secure {
+            return self.content.len();
+        }
         self.content
             .split_word_bound_indices()
             .find_map(|(index, word)| {
@@ -1080,7 +1139,9 @@ impl TextEditorState {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        // Like a browser password field. The action still stops here, so
+        // nothing above the input copies instead.
+        if !self.secure && !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -1088,7 +1149,7 @@ impl TextEditorState {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only || self.selected_range.is_empty() {
+        if self.read_only || self.secure || self.selected_range.is_empty() {
             return;
         }
         self.copy(&Copy, window, cx);
@@ -1108,7 +1169,8 @@ impl TextEditorState {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+        // A secure input keeps no history.
+        if self.read_only || self.secure {
             return;
         }
         if let Some(previous) = self.undo_stack.pop_back() {
@@ -1118,7 +1180,7 @@ impl TextEditorState {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+        if self.read_only || self.secure {
             return;
         }
         if let Some(next) = self.redo_stack.pop() {
@@ -1150,7 +1212,44 @@ impl TextEditorState {
         Some(self.index_for_point(point(current.x, px(target_y))))
     }
 
+    // Layout offsets index the painted text, which for a secure input is one
+    // mask per grapheme rather than the content.
+    fn to_display(&self, offset: usize) -> usize {
+        if !self.secure {
+            return offset;
+        }
+        let graphemes = self
+            .content
+            .grapheme_indices(true)
+            .take_while(|(index, _)| *index < offset)
+            .count();
+        graphemes * SECURE_MASK.len()
+    }
+
+    fn from_display(&self, offset: usize) -> usize {
+        if !self.secure {
+            return offset;
+        }
+        self.content
+            .grapheme_indices(true)
+            .nth(offset / SECURE_MASK.len())
+            .map_or(self.content.len(), |(index, _)| index)
+    }
+
+    fn display_text(&self) -> SharedString {
+        if self.content.is_empty() {
+            self.placeholder.clone()
+        } else if self.secure {
+            SECURE_MASK
+                .repeat(self.content.graphemes(true).count())
+                .into()
+        } else {
+            self.content.clone().into()
+        }
+    }
+
     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let index = self.to_display(index);
         for (line_index, line) in self.last_lines.iter().enumerate() {
             let line_start = *self.line_starts.get(line_index)?;
             if index < line_start || index > line_start + line.len() {
@@ -1181,7 +1280,9 @@ impl TextEditorState {
                 let index = line
                     .closest_index_for_position(local, self.line_height)
                     .unwrap_or_else(|index| index);
-                return (line_start + index).min(self.content.len());
+                return self
+                    .from_display(line_start + index)
+                    .min(self.content.len());
             }
             y -= height;
         }
@@ -1219,8 +1320,12 @@ impl TextEditorState {
                 self.select_to(self.content.len(), cx);
             }
             PressIntent::SelectWord => {
-                let index = self.index_for_mouse_position(event.position);
-                let range = crate::text::selection::word_range(&self.content, index);
+                let range = if self.secure {
+                    0..self.content.len()
+                } else {
+                    let index = self.index_for_mouse_position(event.position);
+                    crate::text::selection::word_range(&self.content, index)
+                };
                 self.move_to(range.start, cx);
                 self.select_to(range.end, cx);
             }
@@ -1384,11 +1489,8 @@ impl TextEditorState {
     }
 
     fn layout_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
-        let (display, is_placeholder) = if self.content.is_empty() {
-            (self.placeholder.clone(), true)
-        } else {
-            (SharedString::from(self.content.clone()), false)
-        };
+        let display = self.display_text();
+        let is_placeholder = self.content.is_empty();
         let rem_size = window.rem_size();
         let font_size = style.font_size.to_pixels(rem_size);
         self.font_size = font_size;
@@ -1414,14 +1516,18 @@ impl TextEditorState {
             strikethrough: None,
         };
         let runs = match self.marked_range.as_ref() {
-            Some(marked) if !is_placeholder => vec![
-                run(marked.start, false),
-                run(marked.len(), true),
-                run(display.len() - marked.end, false),
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect(),
+            Some(marked) if !is_placeholder => {
+                // Runs measure the painted text, masked when secure.
+                let marked = self.to_display(marked.start)..self.to_display(marked.end);
+                vec![
+                    run(marked.start, false),
+                    run(marked.len(), true),
+                    run(display.len() - marked.end, false),
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            }
             _ => vec![run(display.len(), false)],
         };
         let wrap_width = self.multiline.then_some(width);
@@ -1495,6 +1601,10 @@ impl EntityInputHandler for TextEditorState {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        // Text services (macOS reads this) don't get to read a secret back.
+        if self.secure {
+            return None;
+        }
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
         self.content.get(range).map(str::to_string)
@@ -1574,7 +1684,7 @@ impl EntityInputHandler for TextEditorState {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        if self.marked_range.is_none() {
+        if self.marked_range.is_none() && !self.secure {
             let snapshot = self.snapshot();
             push_undo_snapshot(&mut self.undo_stack, snapshot);
             self.redo_stack.clear();
@@ -1646,8 +1756,10 @@ impl EntityInputHandler for TextEditorState {
         Some(self.content.encode_utf16().count())
     }
 
+    // Browsers turn the IME off in password fields. On Windows this detaches
+    // it, and typed characters still arrive through WM_CHAR.
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        !self.read_only
+        !self.read_only && !self.secure
     }
 }
 
@@ -1656,6 +1768,7 @@ impl gpui::Render for TextEditorState {
         let key_down_callback = self.callback.clone();
         let key_up_callback = self.callback.clone();
         let element_id = self.element_id;
+        let secure = self.secure;
         div()
             .key_context(if !self.multiline {
                 INPUT_KEY_CONTEXT
@@ -1706,6 +1819,9 @@ impl gpui::Render for TextEditorState {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .when(self.emits_key_down, move |editor| {
                 editor.on_key_down(move |event, _window, _cx| {
+                    if secure && keystroke_types_text(&event.keystroke) {
+                        return;
+                    }
                     emit_key_event(
                         &key_down_callback,
                         element_id,
@@ -1717,6 +1833,9 @@ impl gpui::Render for TextEditorState {
             })
             .when(self.emits_key_up, move |editor| {
                 editor.on_key_up(move |event, _window, _cx| {
+                    if secure && keystroke_types_text(&event.keystroke) {
+                        return;
+                    }
                     emit_key_event(&key_up_callback, element_id, "keyUp", &event.keystroke, None);
                 })
             })
@@ -1883,11 +2002,8 @@ impl gpui::Element for EditorTextElement {
             }
             let (lines, line_height, scroll_top, scroll_left, display) =
                 self.input.update(cx, |input, _| {
-                    let display = if input.content.is_empty() {
-                        input.placeholder.clone()
-                    } else {
-                        input.content.clone().into()
-                    };
+                    // JS can read this log, so a secure input logs its mask.
+                    let display = input.display_text();
                     (
                         std::mem::take(&mut input.last_lines),
                         input.line_height,
