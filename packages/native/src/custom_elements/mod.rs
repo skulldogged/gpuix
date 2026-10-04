@@ -381,6 +381,12 @@ impl CustomElementRegistry {
         registry.register(Box::new(code::CodeFactory));
         registry.register(Box::new(diff::DiffFactory));
         registry.register(Box::new(markdown::MarkdownFactory));
+        #[cfg(not(target_family = "wasm"))]
+        {
+            registry.register(Box::new(crate::slate::TerminalFactory));
+            registry.register(Box::new(crate::slate::PaneFactory));
+            registry.register(Box::new(crate::slate::AttachFactory));
+        }
         registry
     }
 

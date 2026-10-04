@@ -10,6 +10,9 @@
 use napi::bindgen_prelude::*;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use napi_derive::napi;
+#[cfg(not(target_family = "wasm"))]
+#[path = "../../../../../native/gpuix/slate.rs"]
+mod slate;
 
 // Every frame builds and drops thousands of elements, and the Windows heap
 // took about 7% of a scrolling frame.

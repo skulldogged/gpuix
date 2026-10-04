@@ -1123,7 +1123,7 @@ impl GpuixRenderer {
         recv_ui_response(receiver, "the automation clock command")
     }
 
-    fn request_invalidate(&self) -> Result<()> {
+    pub(crate) fn request_invalidate(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
         return invalidate_window();
 
@@ -1222,6 +1222,7 @@ impl GpuixRenderer {
         let image_memory_mb = options.image_memory_mb;
         let app_handle = app.run_embedded(move |cx: &mut gpui::App| {
             crate::window_state::init(cx, &fonts);
+            crate::slate::init_window(cx);
             crate::custom_elements::input::init(cx);
             crate::custom_elements::img::init(cx, image_memory_mb);
             // After the other bindings: `set_menus` reads key equivalents out of
@@ -1359,6 +1360,7 @@ impl GpuixRenderer {
                                 cx,
                                 window_options.fonts.as_deref().unwrap_or_default(),
                             );
+                            crate::slate::init_window(cx);
                             let image_memory_mb = window_options.image_memory_mb;
                             crate::custom_elements::input::init(cx);
                             crate::custom_elements::img::init(cx, image_memory_mb);
@@ -5043,6 +5045,8 @@ impl gpui::Render for GpuixView {
             self.applied_window_title = Some(self.window_title.clone());
         }
         crate::window_state::update(window, cx);
+        #[cfg(not(target_family = "wasm"))]
+        crate::slate::update_window(window, cx);
         crate::custom_elements::img::ImageMemory::begin_frame(window, cx);
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
