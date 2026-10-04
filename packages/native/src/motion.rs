@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use web_time::Instant;
 
 use crate::style::{DimensionValue, StyleDesc};
@@ -18,6 +18,48 @@ pub(crate) struct MotionStyle {
     pub bottom: Option<f64>,
     pub left: Option<f64>,
     pub border_radius: Option<f64>,
+    pub background_color: Option<MotionColor>,
+    pub border_color: Option<MotionColor>,
+    pub color: Option<MotionColor>,
+}
+
+/// A CSS color resolved to straight RGBA, so motion can interpolate it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MotionColor([f32; 4]);
+
+impl<'de> Deserialize<'de> for MotionColor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let rgba = crate::color::parse_color_rgba(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid motion color {value:?}")))?;
+        Ok(Self([rgba.r, rgba.g, rgba.b, rgba.a]))
+    }
+}
+
+impl MotionColor {
+    /// Premultiplied, so fading from transparent does not pass through black.
+    fn mix(self, to: Self, progress: f64) -> Self {
+        let t = progress as f32;
+        let alpha = self.0[3] + (to.0[3] - self.0[3]) * t;
+        let channel = |i: usize| {
+            let from = self.0[i] * self.0[3];
+            let target = to.0[i] * to.0[3];
+            let value = from + (target - from) * t;
+            if alpha > 0.0 { value / alpha } else { to.0[i] }
+        };
+        Self([channel(0), channel(1), channel(2), alpha])
+    }
+
+    fn css(self) -> String {
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            byte(self.0[0]),
+            byte(self.0[1]),
+            byte(self.0[2]),
+            byte(self.0[3])
+        )
+    }
 }
 
 impl MotionStyle {
@@ -31,12 +73,22 @@ impl MotionStyle {
             bottom: self.bottom.or(fallback.bottom),
             left: self.left.or(fallback.left),
             border_radius: self.border_radius.or(fallback.border_radius),
+            background_color: self.background_color.or(fallback.background_color),
+            border_color: self.border_color.or(fallback.border_color),
+            color: self.color.or(fallback.color),
         }
     }
 
     fn interpolate(self, target: Self, progress: f64) -> Self {
         fn value(from: Option<f64>, to: Option<f64>, progress: f64) -> Option<f64> {
             to.map(|to| from.unwrap_or(to) + (to - from.unwrap_or(to)) * progress)
+        }
+        fn color(
+            from: Option<MotionColor>,
+            to: Option<MotionColor>,
+            progress: f64,
+        ) -> Option<MotionColor> {
+            to.map(|to| from.unwrap_or(to).mix(to, progress))
         }
 
         Self {
@@ -48,6 +100,9 @@ impl MotionStyle {
             bottom: value(self.bottom, target.bottom, progress),
             left: value(self.left, target.left, progress),
             border_radius: value(self.border_radius, target.border_radius, progress),
+            background_color: color(self.background_color, target.background_color, progress),
+            border_color: color(self.border_color, target.border_color, progress),
+            color: color(self.color, target.color, progress),
         }
     }
 
@@ -75,6 +130,15 @@ impl MotionStyle {
         }
         if let Some(value) = self.border_radius {
             style.border_radius = Some(value);
+        }
+        if let Some(value) = self.background_color {
+            style.background_color = Some(value.css());
+        }
+        if let Some(value) = self.border_color {
+            style.border_color = Some(value.css());
+        }
+        if let Some(value) = self.color {
+            style.color = Some(value.css());
         }
     }
 }
