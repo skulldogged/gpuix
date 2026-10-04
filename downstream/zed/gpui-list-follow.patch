@@ -1,0 +1,30 @@
+diff --git a/crates/gpui/src/elements/list.rs b/crates/gpui/src/elements/list.rs
+index bb5f9f7..2f233ca 100644
+--- a/crates/gpui/src/elements/list.rs
++++ b/crates/gpui/src/elements/list.rs
+@@ -1304,6 +1304,7 @@ impl StateInner {
+                 _ => {}
+             }
+ 
++            let was_following = self.follow_state.is_following();
+             let mut layout_response = self.layout_items(
+                 Some(bounds.size.width),
+                 bounds.size.height,
+@@ -1313,6 +1314,17 @@ impl StateInner {
+                 cx,
+             );
+ 
++            // Layout resumed following because the list is at its end again,
++            // such as after its viewport grew, but laid this pass out from the
++            // old position. Lay it out again from the end rather than leave
++            // it there until something else redraws the window.
++            if autoscroll && !was_following && self.follow_state.is_following() {
++                return Err(ListOffset {
++                    item_ix: self.items.summary().count,
++                    offset_in_item: px(0.),
++                });
++            }
++
+             // Avoid honoring autoscroll requests from elements other than our children.
+             window.take_autoscroll();
+ 

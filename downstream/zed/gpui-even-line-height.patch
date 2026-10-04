@@ -1,0 +1,27 @@
+diff --git a/crates/gpui/src/elements/text.rs b/crates/gpui/src/elements/text.rs
+index 3470ac9..a930709 100644
+--- a/crates/gpui/src/elements/text.rs
++++ b/crates/gpui/src/elements/text.rs
+@@ -633,11 +633,17 @@ impl TextLayout {
+     ) -> LayoutId {
+         let text_style = window.text_style();
+         let font_size = text_style.font_size.to_pixels(window.rem_size());
+-        let line_height = window.pixel_snap(
+-            text_style
+-                .line_height
+-                .to_pixels(font_size.into(), window.rem_size()),
+-        );
++        let line_height = text_style
++            .line_height
++            .to_pixels(font_size.into(), window.rem_size());
++        // A relative line height (the φ default) rounds to an even size. An odd
++        // line centred in an even-height row lands on a half pixel, and layout
++        // snapping rounds halves toward zero, so the text sat a pixel high.
++        let line_height = if matches!(text_style.line_height, crate::DefiniteLength::Fraction(_)) {
++            window.pixel_snap(crate::px((line_height.0 / 2.).round() * 2.))
++        } else {
++            window.pixel_snap(line_height)
++        };
+ 
+         let runs = if let Some(runs) = runs {
+             runs

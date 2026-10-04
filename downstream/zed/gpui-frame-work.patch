@@ -1,0 +1,154 @@
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index 122f7b2..9aac016 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -149,17 +149,23 @@ impl Scene {
+     }
+ 
+     pub fn finish(&mut self) {
+-        self.shadows.sort_by_key(|shadow| shadow.order);
+-        self.quads.sort_by_key(|quad| quad.order);
+-        self.paths.sort_by_key(|path| path.order);
+-        self.underlines.sort_by_key(|underline| underline.order);
++        // Unstable sorts. Outside a layer, `BoundsTree` gives a primitive that
++        // overlaps another a later order, so equal keys don't overlap. Inside
++        // one, a text line's, everything shares an order and sprites already
++        // regroup by atlas texture whatever order they painted in. A stable
++        // sort copied every glyph sprite through a scratch buffer each frame.
++        self.shadows.sort_unstable_by_key(|shadow| shadow.order);
++        self.quads.sort_unstable_by_key(|quad| quad.order);
++        self.paths.sort_unstable_by_key(|path| path.order);
++        self.underlines
++            .sort_unstable_by_key(|underline| underline.order);
+         self.monochrome_sprites
+-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
++            .sort_unstable_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+         self.subpixel_sprites
+-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
++            .sort_unstable_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+         self.polychrome_sprites
+-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+-        self.surfaces.sort_by_key(|surface| surface.order);
++            .sort_unstable_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
++        self.surfaces.sort_unstable_by_key(|surface| surface.order);
+     }
+ 
+     #[cfg_attr(
+diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
+index e7362f7..11cc5e3 100644
+--- a/crates/gpui/src/text_system/line_layout.rs
++++ b/crates/gpui/src/text_system/line_layout.rs
+@@ -454,9 +454,65 @@ impl WrappedLineLayout {
+ pub(crate) struct LineLayoutCache {
+     previous_frame: Mutex<FrameCache>,
+     current_frame: RwLock<FrameCache>,
++    retained: Mutex<RetainedLines>,
+     platform_text_system: Arc<dyn PlatformTextSystem>,
+ }
+ 
++/// Lines shaped in earlier frames that the last frame didn't use. A frame only
++/// reuses what the one before it laid out, so a list row that scrolled out of
++/// view and back, or text behind a closed disclosure, was shaped again, and
++/// shaping a long paragraph takes a few milliseconds.
++///
++/// Two generations, each bounded by the text it holds: when the newer one
++/// fills, the older is dropped and the newer takes its place.
++#[derive(Default)]
++struct RetainedLines {
++    newer: RetainedGeneration,
++    older: RetainedGeneration,
++}
++
++#[derive(Default)]
++struct RetainedGeneration {
++    lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
++    wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
++    text_bytes: usize,
++}
++
++impl RetainedLines {
++    const GENERATION_TEXT_BYTES: usize = 256 * 1024;
++
++    fn keep(&mut self, frame: &mut FrameCache) {
++        for (key, line) in frame.lines.drain() {
++            self.newer.text_bytes += key.text.len();
++            self.newer.lines.insert(key, line);
++        }
++        for (key, line) in frame.wrapped_lines.drain() {
++            self.newer.text_bytes += key.text.len();
++            self.newer.wrapped_lines.insert(key, line);
++        }
++        if self.newer.text_bytes > Self::GENERATION_TEXT_BYTES {
++            self.older = std::mem::take(&mut self.newer);
++        }
++    }
++
++    fn take_line(&mut self, key: &dyn AsCacheKeyRef) -> Option<(Arc<CacheKey>, Arc<LineLayout>)> {
++        self.newer
++            .lines
++            .remove_entry(key)
++            .or_else(|| self.older.lines.remove_entry(key))
++    }
++
++    fn take_wrapped_line(
++        &mut self,
++        key: &dyn AsCacheKeyRef,
++    ) -> Option<(Arc<CacheKey>, Arc<WrappedLineLayout>)> {
++        self.newer
++            .wrapped_lines
++            .remove_entry(key)
++            .or_else(|| self.older.wrapped_lines.remove_entry(key))
++    }
++}
++
+ #[derive(Default)]
+ struct FrameCache {
+     lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+@@ -489,6 +545,7 @@ impl LineLayoutCache {
+         Self {
+             previous_frame: Mutex::default(),
+             current_frame: RwLock::default(),
++            retained: Mutex::default(),
+             platform_text_system,
+         }
+     }
+@@ -560,8 +617,8 @@ impl LineLayoutCache {
+         let mut prev_frame = self.previous_frame.lock();
+         let mut curr_frame = self.current_frame.write();
+         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
+-        curr_frame.lines.clear();
+-        curr_frame.wrapped_lines.clear();
++        // What the frame before didn't reuse moves to the retained lines.
++        self.retained.lock().keep(&mut curr_frame);
+         curr_frame.used_lines.clear();
+         curr_frame.used_wrapped_lines.clear();
+ 
+@@ -596,7 +653,12 @@ impl LineLayoutCache {
+             return layout.clone();
+         }
+ 
+-        let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
++        let previous_frame_entry = self
++            .previous_frame
++            .lock()
++            .wrapped_lines
++            .remove_entry(key)
++            .or_else(|| self.retained.lock().take_wrapped_line(key));
+         if let Some((key, layout)) = previous_frame_entry {
+             let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+             current_frame
+@@ -661,7 +723,13 @@ impl LineLayoutCache {
+         }
+ 
+         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+-        if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
++        let previous_frame_entry = self
++            .previous_frame
++            .lock()
++            .lines
++            .remove_entry(key)
++            .or_else(|| self.retained.lock().take_line(key));
++        if let Some((key, layout)) = previous_frame_entry {
+             current_frame.lines.insert(key.clone(), layout.clone());
+             current_frame.used_lines.push(key);
+             layout

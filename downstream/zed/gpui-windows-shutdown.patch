@@ -1,0 +1,38 @@
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index 1a942ec..e8de919 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -589,6 +589,19 @@ impl rwh::HasDisplayHandle for WindowsWindow {
+ 
+ impl Drop for WindowsWindow {
+     fn drop(&mut self) {
++        // GPUI has removed the window. DestroyWindow can still deliver input,
++        // activation and layout messages, and queued callbacks may run later.
++        let callbacks = &self.0.state.callbacks;
++        callbacks.request_frame.take();
++        callbacks.input.take();
++        callbacks.active_status_change.take();
++        callbacks.hovered_status_change.take();
++        callbacks.resize.take();
++        callbacks.moved.take();
++        callbacks.should_close.take();
++        callbacks.close.take();
++        callbacks.hit_test_window_control.take();
++        callbacks.appearance_changed.take();
+         // clone this `Rc` to prevent early release of the pointer
+         let this = self.0.clone();
+         self.0
+@@ -596,8 +609,11 @@ impl Drop for WindowsWindow {
+             .spawn(async move {
+                 let handle = this.hwnd;
+                 unsafe {
+-                    RevokeDragDrop(handle).log_err();
+-                    DestroyWindow(handle).log_err();
++                    // WM_CLOSE may already have destroyed the native window.
++                    if IsWindow(Some(handle)).as_bool() {
++                        RevokeDragDrop(handle).log_err();
++                        DestroyWindow(handle).log_err();
++                    }
+                 }
+             })
+             .detach();

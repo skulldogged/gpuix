@@ -1,0 +1,276 @@
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index ff7e6c2..a0be91f 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2366,7 +2366,7 @@ impl Interactivity {
+         bounds: Bounds<Pixels>,
+         style: &Style,
+         window: &mut Window,
+-        _cx: &mut App,
++        cx: &mut App,
+     ) -> Point<Pixels> {
+         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+             const ROUNDING_FACTOR: f32 = 100.0;
+@@ -2401,6 +2401,22 @@ impl Interactivity {
+             // were removed or the bounds became larger).
+             let mut scroll_offset = scroll_offset.borrow_mut();
+ 
++            if let Some(ongoing_scroll) = &self.ongoing_scroll {
++                let mut ongoing_scroll = ongoing_scroll.borrow_mut();
++                if scroll_to_bottom || cx.reduce_motion() {
++                    ongoing_scroll.wheel.cancel();
++                }
++                *scroll_offset = ongoing_scroll.wheel.advance(
++                    *scroll_offset,
++                    -scroll_max,
++                    Point::default(),
++                    web_time::Instant::now(),
++                );
++                if ongoing_scroll.wheel.active() {
++                    window.request_animation_frame();
++                }
++            }
++
+             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+             if scroll_to_bottom {
+                 scroll_offset.y = -scroll_max.y;
+@@ -3302,6 +3318,19 @@ impl Interactivity {
+                             delta_x = Pixels::ZERO;
+                         }
+                     }
++                    if let Some(ongoing_scroll) = &ongoing_scroll {
++                        let mut ongoing_scroll = ongoing_scroll.borrow_mut();
++                        if !event.delta.precise() && !cx.reduce_motion() {
++                            ongoing_scroll.wheel.push(
++                                *scroll_offset,
++                                point(delta_x, delta_y),
++                                web_time::Instant::now(),
++                            );
++                            window.on_next_frame(move |_, cx| cx.notify(current_view));
++                            return;
++                        }
++                        ongoing_scroll.wheel.cancel();
++                    }
+                     scroll_offset.y += delta_y;
+                     scroll_offset.x += delta_x;
+                     if *scroll_offset != old_scroll_offset {
+@@ -4260,6 +4289,7 @@ impl ScrollHandle {
+     /// As you scroll further down the offset becomes more negative.
+     pub fn set_offset(&self, mut position: Point<Pixels>) {
+         let state = self.0.borrow();
++        state.ongoing_scroll.borrow_mut().wheel.cancel();
+         *state.offset.borrow_mut() = position;
+     }
+ 
+diff --git a/crates/gpui/src/elements/list.rs b/crates/gpui/src/elements/list.rs
+index 55eb6c2..bb5f9f7 100644
+--- a/crates/gpui/src/elements/list.rs
++++ b/crates/gpui/src/elements/list.rs
+@@ -62,6 +62,7 @@ impl std::fmt::Debug for ListState {
+ }
+ 
+ struct StateInner {
++    wheel_scroll: crate::gestures::SmoothScroll,
+     last_layout_bounds: Option<Bounds<Pixels>>,
+     last_padding: Option<Edges<Pixels>>,
+     items: SumTree<ListItem>,
+@@ -315,6 +316,7 @@ impl ListState {
+     /// that the list doesn't flicker or pop in when scrolling.
+     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
+         let this = Self(Rc::new(RefCell::new(StateInner {
++            wheel_scroll: Default::default(),
+             last_layout_bounds: None,
+             last_padding: None,
+             items: SumTree::default(),
+@@ -358,6 +360,7 @@ impl ListState {
+         let old_count = {
+             let state = &mut *self.0.borrow_mut();
+             state.reset = true;
++            state.wheel_scroll.cancel();
+             state.measuring_behavior.reset();
+             state.logical_scroll_top = None;
+             state.pending_scroll = None;
+@@ -571,6 +574,7 @@ impl ListState {
+ 
+         let current_offset = self.logical_scroll_top();
+         let state = &mut *self.0.borrow_mut();
++        state.wheel_scroll.cancel();
+ 
+         if distance < px(0.) {
+             state.follow_state.stop_following();
+@@ -604,6 +608,7 @@ impl ListState {
+     /// growing (e.g. during streaming).
+     pub fn scroll_to_end(&self) {
+         let state = &mut *self.0.borrow_mut();
++        state.wheel_scroll.cancel();
+         let item_count = state.items.summary().count;
+         state.pending_scroll = None;
+         state.logical_scroll_top = Some(ListOffset {
+@@ -667,6 +672,7 @@ impl ListState {
+     /// position while items of unknown height are spliced in above it.
+     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
+         let state = &mut *self.0.borrow_mut();
++        state.wheel_scroll.cancel();
+         let item_count = state.items.summary().count;
+         if scroll_top.item_ix >= item_count {
+             scroll_top.item_ix = item_count;
+@@ -684,6 +690,7 @@ impl ListState {
+     /// Scroll the list to the given item, such that the item is fully visible.
+     pub fn scroll_to_reveal_item(&self, ix: usize) {
+         let state = &mut *self.0.borrow_mut();
++        state.wheel_scroll.cancel();
+ 
+         let mut scroll_top = state.logical_scroll_top();
+         let height = state
+@@ -750,6 +757,7 @@ impl ListState {
+     /// as items in the overdraw get measured, and help offset scroll position changes accordingly.
+     pub fn scrollbar_drag_started(&self) {
+         let mut state = self.0.borrow_mut();
++        state.wheel_scroll.cancel();
+         state.scrollbar_drag_start_height = Some(state.items.summary().height);
+     }
+ 
+@@ -1400,6 +1408,7 @@ impl StateInner {
+     // Scrollbar support
+ 
+     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
++        self.wheel_scroll.cancel();
+         let Some(bounds) = self.last_layout_bounds else {
+             return;
+         };
+@@ -1576,6 +1585,30 @@ impl Element for List {
+         let state = &mut *self.state.0.borrow_mut();
+         state.reset = false;
+ 
++        if cx.reduce_motion() {
++            state.wheel_scroll.cancel();
++        }
++        if state.wheel_scroll.active() {
++            let scroll_top = state.logical_scroll_top();
++            let padding = state.last_padding.unwrap_or_default();
++            let maximum = (state.items.summary().height + padding.top + padding.bottom
++                - bounds.size.height).max(px(0.));
++            let current = Point::new(px(0.), -state.scroll_top(&scroll_top).clamp(px(0.), maximum));
++            let next = state.wheel_scroll.advance(
++                current,
++                Point::new(px(0.), -maximum),
++                Point::default(),
++                web_time::Instant::now(),
++            );
++            if next != current {
++                state.scroll(&scroll_top, bounds.size.height, next - current,
++                    window.current_view(), window, cx);
++            }
++            if state.wheel_scroll.active() {
++                window.request_animation_frame();
++            }
++        }
++
+         let mut style = Style::default();
+         style.refine(&self.style);
+ 
+@@ -1643,6 +1676,22 @@ impl Element for List {
+         let mut accumulated_scroll_delta = ScrollDelta::default();
+         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
++                if !event.delta.precise() && !cx.reduce_motion() {
++                    let mut state = list_state.0.borrow_mut();
++                    if state.reset { return; }
++                    let delta = event.delta.pixel_delta(px(20.));
++                    let current_top = state.logical_scroll_top();
++                    let padding = state.last_padding.unwrap_or_default();
++                    let maximum = (state.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
++                    let current = Point::new(px(0.), -state.scroll_top(&current_top).clamp(px(0.), maximum));
++                    state.wheel_scroll.push(current, Point::new(px(0.), delta.y), web_time::Instant::now());
++                    if delta.y > px(0.) {
++                        state.follow_state.stop_following();
++                    }
++                    window.on_next_frame(move |_, cx| cx.notify(current_view));
++                    return;
++                }
++                list_state.0.borrow_mut().wheel_scroll.cancel();
+                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
+                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                 list_state.0.borrow_mut().scroll(
+diff --git a/crates/gpui/src/gestures.rs b/crates/gpui/src/gestures.rs
+index 997b910..39317a0 100644
+--- a/crates/gpui/src/gestures.rs
++++ b/crates/gpui/src/gestures.rs
+@@ -23,6 +23,77 @@ const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
+ pub struct OngoingScroll {
+     last_event: Option<Instant>,
+     axis: Option<Axis>,
++    pub(crate) wheel: SmoothScroll,
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct SmoothScroll {
++    started: Option<Instant>,
++    origin: Point<Pixels>,
++    target: Point<Pixels>,
++    last: Point<Pixels>,
++}
++
++impl SmoothScroll {
++    pub(crate) fn cancel(&mut self) {
++        self.started = None;
++    }
++
++    pub(crate) fn active(&self) -> bool {
++        self.started.is_some()
++    }
++
++    fn unchanged(&self, current: Point<Pixels>) -> bool {
++        // Lists reconstruct pixel offsets from an item index plus an offset;
++        // allow the rounding error introduced at item boundaries.
++        (current.x - self.last.x).abs() < px(0.01)
++            && (current.y - self.last.y).abs() < px(0.01)
++    }
++
++    pub(crate) fn push(&mut self, current: Point<Pixels>, delta: Point<Pixels>, now: Instant) {
++        let mut remaining = if self.active() && self.unchanged(current) {
++            self.target - current
++        } else {
++            Point::default()
++        };
++        // Reversing the wheel should respond immediately, not fight queued movement.
++        if f32::from(remaining.x) * f32::from(delta.x) < 0. {
++            remaining.x = px(0.);
++        }
++        if f32::from(remaining.y) * f32::from(delta.y) < 0. {
++            remaining.y = px(0.);
++        }
++        self.origin = current;
++        self.last = current;
++        self.target = current + remaining + delta;
++        self.started = Some(now);
++    }
++
++    pub(crate) fn advance(
++        &mut self,
++        current: Point<Pixels>,
++        minimum: Point<Pixels>,
++        maximum: Point<Pixels>,
++        now: Instant,
++    ) -> Point<Pixels> {
++        let Some(started) = self.started else { return current };
++        // Scrollbar dragging, navigation and anchoring own any external offset change.
++        if !self.unchanged(current) {
++            self.cancel();
++            return current;
++        }
++        self.target.x = self.target.x.clamp(minimum.x, maximum.x);
++        self.target.y = self.target.y.clamp(minimum.y, maximum.y);
++        let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.14).min(1.);
++        let eased = 1. - (1. - progress).powi(3);
++        self.last = self.origin + (self.target - self.origin) * eased;
++        self.last.x = self.last.x.clamp(minimum.x, maximum.x);
++        self.last.y = self.last.y.clamp(minimum.y, maximum.y);
++        if progress >= 1. || self.last == self.target {
++            self.cancel();
++        }
++        self.last
++    }
+ }
+ 
+ impl OngoingScroll {

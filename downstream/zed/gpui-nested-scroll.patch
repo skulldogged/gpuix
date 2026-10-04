@@ -1,0 +1,112 @@
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2530,13 +2530,27 @@
+                                                 );
+                                             }
+ 
++                                            // Bubble listeners run in reverse order. Consume after
++                                            // this viewport's own observers, but before its ancestors.
++                                            let handled_scroll = self.scroll_offset.as_ref().map(|_| {
++                                                let handled = Rc::new(std::cell::Cell::new(false));
++                                                let consume = handled.clone();
++                                                window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _, cx| {
++                                                    if phase == DispatchPhase::Bubble && consume.replace(false) {
++                                                        cx.stop_propagation();
++                                                    }
++                                                });
++                                                handled
++                                            });
+                                             self.paint_mouse_listeners(
+                                                 hitbox,
+                                                 element_state.as_mut(),
+                                                 window,
+                                                 cx,
+                                             );
+-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
++                                            if let Some(handled) = handled_scroll {
++                                                self.paint_scroll_listener(hitbox, bounds, &style, handled, window, cx);
++                                            }
+                                         }
+ 
+                                         self.paint_keyboard_listeners(window, cx);
+@@ -3266,12 +3280,19 @@
+     fn paint_scroll_listener(
+         &self,
+         hitbox: &Hitbox,
++        bounds: Bounds<Pixels>,
+         style: &Style,
++        handled: Rc<std::cell::Cell<bool>>,
+         window: &mut Window,
+         _cx: &mut App,
+     ) {
+         if let Some(scroll_offset) = self.scroll_offset.clone() {
+             let ongoing_scroll = self.ongoing_scroll.clone();
++            let padding = style.padding.to_pixels(bounds.size.into(), window.rem_size());
++            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
++            let scroll_max = Point::from(self.content_size + padding_size - bounds.size)
++                .map(|value| (value * 100.0).round() / 100.0)
++                .max(&Default::default());
+             let overflow = style.overflow;
+             let allow_concurrent_scroll = style.allow_concurrent_scroll;
+             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
+@@ -3279,6 +3300,9 @@
+             let hitbox = hitbox.clone();
+             let current_view = window.current_view();
+             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
++                if phase == DispatchPhase::Bubble {
++                    handled.set(false);
++                }
+                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                     let mut scroll_offset = scroll_offset.borrow_mut();
+                     let old_scroll_offset = *scroll_offset;
+@@ -3311,6 +3335,12 @@
+                         }
+                         _ => Pixels::ZERO,
+                     };
++                    if scroll_max.x.is_zero() {
++                        delta_x = Pixels::ZERO;
++                    }
++                    if scroll_max.y.is_zero() {
++                        delta_y = Pixels::ZERO;
++                    }
+                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
+                         if delta_x.abs() > delta_y.abs() {
+                             delta_y = Pixels::ZERO;
+@@ -3318,6 +3348,12 @@
+                             delta_x = Pixels::ZERO;
+                         }
+                     }
++                    if delta_x.is_zero() && delta_y.is_zero() {
++                        return;
++                    }
++                    // Keep the gesture in the deepest overflowing viewport, even
++                    // at its edges, for both smooth and direct scrolling.
++                    handled.set(true);
+                     if let Some(ongoing_scroll) = &ongoing_scroll {
+                         let mut ongoing_scroll = ongoing_scroll.borrow_mut();
+                         if !event.delta.precise() && !cx.reduce_motion() {
+--- a/crates/gpui/src/elements/list.rs
++++ b/crates/gpui/src/elements/list.rs
+@@ -1688,10 +1688,21 @@
+         let mut accumulated_scroll_delta = ScrollDelta::default();
+         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
++                let delta = event.delta.pixel_delta(px(20.));
++                {
++                    let state = list_state.0.borrow();
++                    let padding = state.last_padding.unwrap_or_default();
++                    let content_height = state.items.summary().height + padding.top + padding.bottom;
++                    if state.reset || delta.y == Pixels::ZERO || content_height <= height {
++                        return;
++                    }
++                }
++                // Match div scroll containers: contain a vertical gesture when
++                // this list overflows, including at the first and last item.
++                cx.stop_propagation();
+                 if !event.delta.precise() && !cx.reduce_motion() {
+                     let mut state = list_state.0.borrow_mut();
+                     if state.reset { return; }
+-                    let delta = event.delta.pixel_delta(px(20.));
+                     let current_top = state.logical_scroll_top();
+                     let padding = state.last_padding.unwrap_or_default();
+                     let maximum = (state.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
