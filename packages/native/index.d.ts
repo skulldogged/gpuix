@@ -34,6 +34,18 @@ export declare class AvailableUpdate {
 
 /** The main GPUI renderer exposed to Node.js. */
 export declare class GpuixRenderer {
+  /**
+   * Highlight code in JavaScript: `callback` gets each code block missing
+   * from the syntax cache, and answers through [`Self::answer_highlight`].
+   */
+  onHighlight(callback: ((err: Error | null, arg: HighlightRequest) => any)): void
+  /**
+   * Answer highlight request `id`. `spans` holds `[start, end, kind]`
+   * triples: UTF-8 byte ranges into the request's code, and indices into
+   * `kinds`, which names `HighlightKind`s in camelCase. `null` spans mean
+   * the code can't be highlighted.
+   */
+  answerHighlight(id: number, kinds: Array<string>, spans?: Uint32Array | undefined | null): void
   constructor(eventCallback?: (((err: Error | null, arg: EventPayload) => any)) | undefined | null)
   /** Initialize GPUI using the native event-loop architecture for this OS. */
   init(options?: WindowOptions | undefined | null): void
@@ -77,6 +89,12 @@ export declare class GpuixRenderer {
    * wrong place on every window that was not exactly that size.
    */
   getWindowSize(): WindowSize
+  /**
+   * Maximized, fullscreen, active and dark, plus the size, as of the last
+   * frame. Never waits on the window, so it is safe to poll and still
+   * answers after the window closed.
+   */
+  getWindowState(): WindowState
   getWindowInsets(): WindowInsets
   /** `"hidden"` | `"minimal"` | `"full"`. Paints into the scene after layout. */
   setDebugFrameOverlay(mode: string): string
@@ -195,229 +213,8 @@ export declare class GpuixRenderer {
   captureScreenshot(path: string): void
 }
 
-/**
- * GPU-backed GPUI test renderer. Uses VisualTestAppContext with the native
- * Metal or DirectX renderer and TestDispatcher for deterministic scheduling.
- * Same GpuixView and rendering pipeline as production.
- *
- * Usage from JS:
- *   const r = new TestGpuixRenderer()
- *   r.applyBatch('[["createElement",1,"div"],["setRoot",1]]')
- *   r.flush()                  // triggers GpuixView::render() on the GPU
- *   r.simulateClick(50, 50)    // dispatches through GPUI hit testing
- *   const events = r.drainEvents()
- *   r.captureScreenshot("/tmp/test.png")  // saves rendered UI as PNG
- */
 export declare class TestGpuixRenderer {
   constructor(width?: number | undefined | null, height?: number | undefined | null)
-  /**
-   * How many elements the retained tree holds, reachable from the root or
-   * not. `getTreeJson` walks from the root, so it cannot see a node that was
-   * detached and never destroyed. This is the only way a test can prove a
-   * removal actually freed it.
-   */
-  getRetainedElementCount(): number
-  /**
-   * Apply a batch of mutations in a single FFI call.
-   * Same format as GpuixRenderer::apply_batch (string op names).
-   * Returns accumulated destroyed IDs from all destroyElement ops.
-   */
-  applyBatch(json: string): Array<number>
-  /**
-   * Notify the view entity and run GPUI until parked.
-   * This triggers GpuixView::render() → build_element() → GPUI layout.
-   * Must be called after mutations and before simulating events (GPUI's
-   * hit testing requires elements to be laid out).
-   */
-  flush(): void
-  /**
-   * Simulate a click at the given window coordinates.
-   * Dispatches MouseDown + MouseUp through GPUI's input pipeline,
-   * which triggers the same event handlers as production.
-   * IMPORTANT: Call flush() before this — hit testing requires laid-out elements.
-   * `modifiers` uses the `press()` syntax: "cmd", "cmd-shift", "alt".
-   */
-  simulateClick(x: number, y: number, button?: number | undefined | null, modifiers?: string | undefined | null): void
-  /**
-   * Simulate key strokes through GPUI's input pipeline.
-   * Format: space-separated keys, e.g. "a", "enter", "cmd-shift-p".
-   * The focused element receives keyDown/keyUp events.
-   */
-  simulateKeystrokes(keystrokes: string): void
-  /**
-   * Simulate a single key down event through GPUI's input pipeline.
-   * Format: modifier-key string, e.g. "a", "enter", "cmd-s".
-   * Unlike simulate_keystrokes, this dispatches ONLY a KeyDownEvent —
-   * no automatic KeyUpEvent follows. Use with simulate_key_up for
-   * fine-grained key event testing.
-   */
-  simulateKeyDown(keystroke: string, isHeld?: boolean | undefined | null): void
-  /**
-   * Simulate a single key up event through GPUI's input pipeline.
-   * Format: modifier-key string, e.g. "a", "enter", "cmd-s".
-   * Pairs with simulate_key_down for fine-grained key event testing.
-   */
-  simulateKeyUp(keystroke: string): void
-  /**
-   * Simulate a mouse move to the given coordinates.
-   * pressed_button: optional mouse button held during move (0=left, 1=middle, 2=right).
-   * Used to simulate drag events.
-   */
-  simulateMouseMove(x: number, y: number, pressedButton?: number | undefined | null, modifiers?: string | undefined | null): void
-  /**
-   * Focus an element by its numeric ID.
-   * The element must have a FocusHandle (created by sync_focus_handles when
-   * the element has keyDown, keyUp, focus, or blur listeners).
-   * Call flush() before this so the element tree and focus handles exist.
-   */
-  focusElement(id: number): void
-  focusNext(): void
-  focusPrevious(): void
-  promptForPaths(options?: PathPromptOptions | undefined | null): Promise<Array<string> | null>
-  getFocusedElementId(): number | null
-  focusNextWithin(elementId: number): void
-  focusPreviousWithin(elementId: number): void
-  setWindowKeyEvents(keyDown: boolean, keyUp: boolean, eventId: number): void
-  setWindowSelectionChange(enabled: boolean, eventId: number): void
-  /**
-   * Simulate a mouse down event at the given window coordinates.
-   * Button: 0=left, 1=middle, 2=right. Defaults to left (0).
-   */
-  simulateMouseDown(x: number, y: number, button?: number | undefined | null, modifiers?: string | undefined | null): void
-  /**
-   * Simulate a mouse up event at the given window coordinates.
-   * Button: 0=left, 1=middle, 2=right. Defaults to left (0).
-   */
-  simulateMouseUp(x: number, y: number, button?: number | undefined | null, modifiers?: string | undefined | null): void
-  /**
-   * Simulate a scroll wheel event at the given position.
-   * delta_x and delta_y are in pixels (negative = scroll up/left).
-   */
-  simulateScrollWheel(x: number, y: number, deltaX: number, deltaY: number, modifiers?: string | undefined | null): void
-  /**
-   * Simulate a Finder-style file drop at the given window coordinates.
-   * Dispatches FileDrop Entered then Submit, matching GPUI's OS drop path.
-   */
-  simulateFileDrop(x: number, y: number, paths: Array<string>): void
-  /** The current text selection joined in document order, or null. */
-  getSelectedText(): string | null
-  /** Drop the current selection. */
-  clearSelection(): void
-  /**
-   * Syntax-cache counters as `[hits, misses, documents]`.
-   *
-   * GPUIX rebuilds its whole element tree every frame, so a `<code>` block
-   * that misses the cache reparses at frame rate. A test can watch the hit
-   * count to catch that regression before a profiler does.
-   */
-  getSyntaxCacheStats(): Array<number>
-  /**
-   * Every string painted in the last frame, in paint order.
-   *
-   * `getAllText()` only sees `<text>` nodes in the retained tree. Native
-   * elements such as `<code>` and `<diff>` draw their text inside gpui, so
-   * this is the only way to assert on what they actually rendered.
-   */
-  getPaintedText(): Array<string>
-  /**
-   * Every highlight wash painted in the last frame, in paint order.
-   *
-   * A quad is invisible to `getPaintedText()`, so this is the only way to
-   * assert on `highlight` without a screenshot. Each entry carries its rects,
-   * so a soft-wrapped match is provably two boxes.
-   */
-  getPaintedHighlights(): Array<HighlightMatch>
-  /**
-   * Drag-select from one point to another: mouse down, move, up.
-   *
-   * A single helper rather than three calls because the listeners that drive
-   * selection are registered during **paint**, so a flush must sit between
-   * the down and the move. Getting that order wrong silently selects nothing,
-   * which is a miserable thing to debug from JS.
-   */
-  dragSelect(x1: number, y1: number, x2: number, y2: number): void
-  /**
-   * Set the scroll offset of a scrollable element.
-   * x and y are negative pixel values (scroll down = more negative y).
-   * Call flush() after to apply the offset and re-render.
-   */
-  scrollTo(elementId: number, x: number, y: number): void
-  /**
-   * Scroll a child into view by its index in the children list.
-   * Call flush() after to apply and re-render. For a `<virtual-list>` the
-   * scroll is queued and applied on that flush, after the child splice.
-   * `offset_in_item` is in pixels and may be negative, which anchors the
-   * viewport top above the item.
-   */
-  scrollToItem(elementId: number, index: number, offsetInItem?: number | undefined | null): void
-  /** Scroll this element's nearest scroll parent until the element is visible. */
-  scrollIntoView(elementId: number): void
-  /** Packed `"rgba"` (default) or `"bgra"` pixels onto an `<img>` host node. */
-  setImagePixels(elementId: number, width: number, height: number, pixels: Buffer, format?: string | undefined | null): void
-  /** Encoded image bytes onto an `<img>` host node. */
-  setImage(elementId: number, bytes: Buffer): void
-  /**
-   * The logical scroll anchor of a `<virtual-list>`:
-   * `[itemIndex, offsetInItemPx, viewportHeightPx]`, or null for anything
-   * else. `itemIndex == item count` is gpui's at-end sentinel.
-   */
-  getListScrollTop(elementId: number): Array<number> | null
-  /** `"hidden"` | `"minimal"` | `"full"`. */
-  setDebugFrameOverlay(mode: string): string
-  /** Hidden → minimal → full → hidden. */
-  cycleDebugFrameOverlay(): string
-  getDebugFrameOverlay(): string
-  /** Clears the last 1000 draw samples. Frame count stays. */
-  resetDebugFrameOverlayStats(): void
-  /** Same numbers as the on-screen overlay: current, p90, p99, max, frames. */
-  getDebugFrameOverlayStats(): DebugFrameOverlayStats
-  /**
-   * Get the current scroll offset of a scrollable element.
-   * Returns [x, y] or null if the element has no scroll handle.
-   */
-  getScrollOffset(elementId: number): Array<number> | null
-  /**
-   * Capture a screenshot of the current rendered state and save as PNG.
-   * Supported on macOS through Metal and Windows through DirectX.
-   */
-  captureScreenshot(path: string): void
-  /**
-   * Return and clear all collected events since the last drain.
-   * Events are collected synchronously — no event loop queuing.
-   */
-  drainEvents(): Array<EventPayload>
-  /** Get all text content in the tree (depth-first order). */
-  getAllText(): Array<string>
-  /** Find element IDs matching the given type (e.g. "div", "text"). */
-  findByType(elementType: string): Array<number>
-  /** Check if an element has a specific event listener. */
-  hasEventListener(id: number, eventType: string): boolean
-  /** Get the text content of an element. */
-  getText(id: number): string | null
-  /** Get the full tree as JSON for snapshot testing. */
-  getTreeJson(): string
-  /**
-   * GPUI accessibility dump from the last painted frame.
-   * Empty until a11y is active; the test renderer turns that on at construct.
-   */
-  getA11yTree(): string
-  /** Tree JSON with last-paint bounds. Used by the automation locators. */
-  getAutomationTree(): string
-  /** Last painted bounds for an element, or null if it was not painted. */
-  getElementBounds(id: number): ElementBounds | null
-  clockPause(): number
-  clockSet(nowMs: number): number
-  clockFastForward(deltaMs: number): number
-  clockResume(): number
-  /** Advance GPUI's deterministic test executor and run due timers. */
-  advanceTime(milliseconds: number): void
-  /** Get the root element ID, or null if no root is set. */
-  getRootId(): number | null
-  /**
-   * The offscreen window size, so `useWindowSize()` reports the same numbers
-   * under test as in a real window instead of falling back to a default.
-   */
-  getWindowSize(): WindowSize
 }
 
 /**
@@ -490,7 +287,7 @@ export interface EventPayload {
   /** Mouse Y position in window coordinates (pixels). */
   y?: number
   /**
-   * Which mouse button: 0=left, 1=middle, 2=right, 3=back, 4=forward.
+   * Which mouse button: 0=left, 1=middle, 2=right.
    * Populated for: mouseDown, mouseUp, click, mouseDownOutside, contextMenu.
    */
   button?: number
@@ -625,6 +422,15 @@ export interface HighlightRect {
   height: number
 }
 
+/** A code block for JavaScript to highlight; see [`GpuixRenderer::on_highlight`]. */
+export interface HighlightRequest {
+  id: number
+  code: string
+  /** The Markdown fence tag or `<code>` language, as written. */
+  language?: string
+  path?: string
+}
+
 /**
  * Wayland `wlr-layer-shell` surface options. Linux/Wayland only; ignored on
  * every other platform. When present on `WindowOptions`, the window is opened
@@ -713,6 +519,21 @@ export interface WindowOptions {
   /** Hide the native titlebar so the app can draw chrome under the traffic lights. */
   titlebarTransparent?: boolean
   /**
+   * Let the app draw the whole window, title bar included. Mark its regions
+   * with `<gpuix-caption>` so dragging and the caption buttons stay native.
+   */
+  clientDecorations?: boolean
+  /**
+   * Font files to load before the window opens, so styles can name their
+   * families without the fonts being installed.
+   */
+  fonts?: Array<string>
+  /**
+   * Decoded `<img>` files and URLs kept in memory while off screen, in MB.
+   * Defaults to 256; the least recently drawn go first.
+   */
+  imageMemoryMb?: number
+  /**
    * `"opaque"` | `"transparent"` | `"blurred"`. `transparent: true` is the
    * same as `"transparent"` when this is unset.
    */
@@ -743,6 +564,18 @@ export interface WindowOptions {
 }
 
 export interface WindowSize {
+  width: number
+  height: number
+}
+
+export interface WindowState {
+  closed: boolean
+  maximized: boolean
+  fullscreen: boolean
+  /** Whether this is the foreground window; native caption glyphs dim when not. */
+  active: boolean
+  /** The system appearance, for themes that follow it. */
+  dark: boolean
   width: number
   height: number
 }
