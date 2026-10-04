@@ -47,6 +47,8 @@ web-time = "1"
 # again. Syntect also rejects both engines at once, so the two sections below
 # must stay exactly complementary.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Aurelia's desktop runtime; its extension is `apps/desktop/native/aurelia.rs`.
+aurelia-desktop = { path = "../../../../apps/desktop" }
 syntect = { version = "5.3", default-features = false, features = ["regex-onig"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
 gpui = { path = "../../zed/crates/gpui", default-features = false, features = ["font-kit", "profiler"] }

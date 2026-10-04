@@ -35,6 +35,16 @@ export declare class AvailableUpdate {
 /** The main GPUI renderer exposed to Node.js. */
 export declare class GpuixRenderer {
   /**
+   * Start a runtime request (JSON with a `type`); its result arrives
+   * through `aureliaPoll`.
+   */
+  aureliaRequest(json: string): number
+  /**
+   * Finished requests, playback state and sync progress, as JSON. `seen`
+   * is the player revision the interface already has.
+   */
+  aureliaPoll(seen: number): string
+  /**
    * Highlight code in JavaScript: `callback` gets each code block missing
    * from the syntax cache, and answers through [`Self::answer_highlight`].
    */

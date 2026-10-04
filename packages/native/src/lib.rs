@@ -18,6 +18,9 @@ use napi_derive::napi;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod accessibility;
+#[cfg(not(target_family = "wasm"))]
+#[path = "../../../../../apps/desktop/native/aurelia.rs"]
+mod aurelia;
 #[cfg(target_os = "macos")]
 mod app_menu;
 mod automation;
