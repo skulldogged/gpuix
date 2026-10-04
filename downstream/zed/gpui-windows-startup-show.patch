@@ -1,0 +1,39 @@
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -365,6 +365,7 @@
+             WindowOpenState::Windowed => unsafe {
+                 SetWindowPlacement(self.hwnd, &open_status.placement)
+                     .context("failed to set window placement")?;
++                show_despite_startup_info(self.hwnd, open_status.placement.showCmd);
+             },
+         }
+         Ok(())
+@@ -560,6 +561,7 @@
+                 placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+             }
+             unsafe { SetWindowPlacement(hwnd, &placement)? };
++            show_despite_startup_info(hwnd, placement.showCmd);
+         } else {
+             this.state.initial_placement.set(Some(WindowOpenStatus {
+                 placement,
+@@ -1533,6 +1535,19 @@
+     }
+ }
+ 
++/// A launcher can ask for a process's first window to stay hidden:
++/// `STARTF_USESHOWWINDOW` with `SW_HIDE`, which script runners such as
++/// `bun run` set so a console child does not flash a console. Windows applies
++/// it to the first show of a top-level window, so a window shown on purpose
++/// stays hidden. Only that first show is replaced, so showing again works.
++fn show_despite_startup_info(hwnd: HWND, show_cmd: u32) {
++    unsafe {
++        if !IsWindowVisible(hwnd).as_bool() {
++            let _ = ShowWindow(hwnd, SHOW_WINDOW_CMD(show_cmd as i32));
++        }
++    }
++}
++
+ fn retrieve_window_placement(
+     hwnd: HWND,
+     display: WindowsDisplay,

@@ -29,6 +29,10 @@ GPUI (`downstream/zed`):
 - Even-pixel relative line heights, so single-line text is centred.
 - Shaped text kept across frames, and an unstable scene sort.
 - Windows: callbacks unregistered before a closed window is destroyed.
+- Windows: a window shown on purpose appears even when the launcher asked
+  for a hidden first window, as `bun run` does.
+- `Window::paint_glyph_unsnapped` places a glyph to a quarter pixel
+  vertically, so text that moves slowly glides instead of stepping.
 
 GPUIX:
 

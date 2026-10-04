@@ -1,0 +1,182 @@
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index 3346389..a3f21b9 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -47,6 +47,10 @@ pub const SUBPIXEL_VARIANTS_X: u8 = 4;
+ /// Number of subpixel glyph variants along the Y axis.
+ pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
+ 
++/// Vertical subpixel steps for [`Window::paint_glyph_unsnapped`]. A glyph's
++/// `RenderGlyphParams::subpixel_variant.y` counts in these steps.
++pub const UNSNAPPED_SUBPIXEL_VARIANTS_Y: u8 = 4;
++
+ /// The GPUI text rendering sub system.
+ pub struct TextSystem {
+     platform_text_system: Arc<dyn PlatformTextSystem>,
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index c98650a..581498b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -19,10 +19,10 @@ use crate::{
+     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+-    transparent_black,
++    TextStyleRefinement, ThermalState, TransformationMatrix, UNSNAPPED_SUBPIXEL_VARIANTS_Y,
++    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
++    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
++    point, prelude::*, px, rems, size, transparent_black,
+ };
+ 
+ use anyhow::{Context as _, Result, anyhow};
+@@ -4351,6 +4351,48 @@ impl Window {
+         glyph_id: GlyphId,
+         font_size: Pixels,
+         color: Hsla,
++    ) -> Result<()> {
++        self.paint_glyph_at(
++            origin,
++            font_id,
++            glyph_id,
++            font_size,
++            color,
++            SUBPIXEL_VARIANTS_Y,
++        )
++    }
++
++    /// Like [`Self::paint_glyph`], but placed vertically to a quarter pixel
++    /// instead of snapped to a whole one, so text that moves slowly glides
++    /// rather than stepping. Each quarter position rasterizes separately.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_glyph_unsnapped(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++    ) -> Result<()> {
++        self.paint_glyph_at(
++            origin,
++            font_id,
++            glyph_id,
++            font_size,
++            color,
++            UNSNAPPED_SUBPIXEL_VARIANTS_Y,
++        )
++    }
++
++    fn paint_glyph_at(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++        vertical_variants: u8,
+     ) -> Result<()> {
+         self.invalidator.debug_assert_paint();
+ 
+@@ -4361,12 +4403,12 @@ impl Window {
+         let quantized_origin = Point::new(
+             round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                 / SUBPIXEL_VARIANTS_X as f32,
+-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+-                / SUBPIXEL_VARIANTS_Y as f32,
++            round_half_toward_zero(glyph_origin.y.0 * vertical_variants as f32)
++                / vertical_variants as f32,
+         );
+         let subpixel_variant = Point::new(
+             (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
++            (quantized_origin.y.fract() * UNSNAPPED_SUBPIXEL_VARIANTS_Y as f32).round() as u8,
+         );
+         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+diff --git a/crates/gpui_macos/src/text_system.rs b/crates/gpui_macos/src/text_system.rs
+index fbc4886..c2e2f93 100644
+--- a/crates/gpui_macos/src/text_system.rs
++++ b/crates/gpui_macos/src/text_system.rs
+@@ -37,7 +37,7 @@ use gpui::{
+     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
+     FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
+     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
+-    Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
++    Size, TextRenderingMode, UNSNAPPED_SUBPIXEL_VARIANTS_Y, point, px, size, swap_rgba_pa_to_bgra,
+ };
+ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+ use pathfinder_geometry::{
+@@ -488,9 +488,10 @@ impl MacTextSystemState {
+                 params.scale_factor as CGFloat,
+             );
+ 
+-            let subpixel_shift = params
+-                .subpixel_variant
+-                .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
++            let subpixel_shift = point(
++                params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
++                params.subpixel_variant.y as f32 / UNSNAPPED_SUBPIXEL_VARIANTS_Y as f32,
++            );
+             cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
+             cx.set_allows_antialiasing(true);
+             cx.set_should_antialias(true);
+diff --git a/crates/gpui_wgpu/src/cosmic_text_system.rs b/crates/gpui_wgpu/src/cosmic_text_system.rs
+index e84d924..d7b05ab 100644
+--- a/crates/gpui_wgpu/src/cosmic_text_system.rs
++++ b/crates/gpui_wgpu/src/cosmic_text_system.rs
+@@ -7,8 +7,8 @@ use cosmic_text::{
+ use gpui::{
+     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
+     IsZero as _, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
+-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
+-    size,
++    ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, UNSNAPPED_SUBPIXEL_VARIANTS_Y,
++    point, size,
+ };
+ 
+ use itertools::Itertools;
+@@ -443,7 +443,9 @@ impl CosmicTextSystemState {
+ 
+         let subpixel_offset = Vector::new(
+             params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
+-            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
++            params.subpixel_variant.y as f32
++                / UNSNAPPED_SUBPIXEL_VARIANTS_Y as f32
++                / params.scale_factor,
+         );
+ 
+         let mut scaler = self
+diff --git a/crates/gpui_windows/src/direct_write.rs b/crates/gpui_windows/src/direct_write.rs
+index 5a761cc..3b82cb5 100644
+--- a/crates/gpui_windows/src/direct_write.rs
++++ b/crates/gpui_windows/src/direct_write.rs
+@@ -693,7 +693,7 @@ impl DirectWriteState {
+         let baseline_origin_x =
+             params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor;
+         let baseline_origin_y = params.subpixel_variant.y as f32
+-            / gpui::SUBPIXEL_VARIANTS_Y as f32
++            / gpui::UNSNAPPED_SUBPIXEL_VARIANTS_Y as f32
+             / params.scale_factor;
+ 
+         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
+@@ -886,11 +886,11 @@ impl DirectWriteState {
+         // touch. An immediate `ID3D11DeviceContext` is not thread-safe, so this must only run on
+         // the main UI thread (which it always is; text rasterization never leaves that thread).
+         let bitmap_size = glyph_bounds.size;
+-        let subpixel_shift = params
+-            .subpixel_variant
+-            .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
+-        let baseline_origin_x = subpixel_shift.x / params.scale_factor;
+-        let baseline_origin_y = subpixel_shift.y / params.scale_factor;
++        let baseline_origin_x =
++            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor;
++        let baseline_origin_y = params.subpixel_variant.y as f32
++            / UNSNAPPED_SUBPIXEL_VARIANTS_Y as f32
++            / params.scale_factor;
+ 
+         let transform = DWRITE_MATRIX {
+             m11: params.scale_factor,

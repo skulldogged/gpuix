@@ -23,6 +23,8 @@ const STACK = [
   "gpui-list-follow.patch",
   "gpui-nested-scroll.patch",
   "gpui-frame-work.patch",
+  "gpui-windows-startup-show.patch",
+  "gpui-unsnapped-glyphs.patch",
 ];
 
 function run(args: string[], cwd: string) {
