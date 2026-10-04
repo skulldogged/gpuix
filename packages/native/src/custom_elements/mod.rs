@@ -128,7 +128,13 @@ pub(crate) fn custom_surface(
     {
         el = el.relative();
     }
-    el = el.child(crate::automation::bounds_tracker(ctx.id, None));
+    // An explicit `userSelect` claims the box as a selection-start region, as
+    // it does on `<div>`; without it a `userSelect: "text"` Markdown under a
+    // `"none"` ancestor would paint selectable text that no drag can start.
+    el = el.child(crate::automation::bounds_tracker(
+        ctx.id,
+        crate::renderer::selection_start_flag(ctx.style),
+    ));
     el = crate::accessibility::apply_accessibility(el, ctx.props, None);
     wire_standard_events(el, ctx)
 }

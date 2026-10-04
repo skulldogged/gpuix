@@ -19,8 +19,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, quad, size, BorderStyle, Bounds, Hsla, SharedString,
-    StyledText, TextLayout, TextRun, Window,
+    canvas, div, point, prelude::*, px, quad, size, BorderStyle, Bounds, CursorStyle, Hitbox,
+    HitboxBehavior, Hsla, SharedString, StyledText, TextLayout, TextRun, Window,
 };
 
 use super::selection::{self, SelectionState};
@@ -271,10 +271,19 @@ pub fn selectable_text(opts: SelectableText) -> gpui::AnyElement {
         None => StyledText::new(text.clone()),
     };
     let layout = styled.layout().clone();
+    let clickable = on_link.is_some() && !links.is_empty();
 
     let underlay = canvas(
-        |_, _, _| (),
-        move |_, _, window, _| {
+        // A `Normal` hitbox blocks nothing behind it; it only lets the text
+        // ask for a cursor.
+        move |bounds, window, _| {
+            (selectable || clickable)
+                .then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal))
+        },
+        move |_, hitbox, window, _| {
+            if let Some(hitbox) = &hitbox {
+                register_text_cursor(window, hitbox, &layout, selectable, &links, clickable);
+            }
             if let Some(paint) = &extra_wash {
                 paint(&layout, window);
             }
@@ -329,6 +338,61 @@ pub fn selectable_text(opts: SelectableText) -> gpui::AnyElement {
         .child(underlay)
         .child(styled)
         .into_any_element()
+}
+
+/// The cursor a run asks for at `position`: a hand over a clickable link, an
+/// I-beam over selectable glyphs, and nothing elsewhere, so the empty end of a
+/// line keeps its container's cursor, as in a browser.
+fn text_cursor(
+    layout: &TextLayout,
+    position: gpui::Point<gpui::Pixels>,
+    selectable: bool,
+    links: &[(Range<usize>, String)],
+    clickable: bool,
+) -> Option<CursorStyle> {
+    // Only an exact hit is `Ok`; past the end of a line is `Err`.
+    let ix = layout.index_for_position(position).ok()?;
+    if clickable && links.iter().any(|(range, _)| range.contains(&ix)) {
+        Some(CursorStyle::PointingHand)
+    } else {
+        selectable.then_some(CursorStyle::IBeam)
+    }
+}
+
+/// Request the run's cursor for this frame. GPUI re-tests hitboxes on every
+/// mouse move but keeps the cursors requested at the last paint, so moving
+/// onto or off the glyphs within one hitbox needs a new frame, as
+/// `gpui::InteractiveText` does for its clickable ranges.
+fn register_text_cursor(
+    window: &mut Window,
+    hitbox: &Hitbox,
+    layout: &TextLayout,
+    selectable: bool,
+    links: &[(Range<usize>, String)],
+    clickable: bool,
+) {
+    use gpui::{DispatchPhase, MouseMoveEvent};
+
+    let cursor = hitbox
+        .is_hovered(window)
+        .then(|| text_cursor(layout, window.mouse_position(), selectable, links, clickable))
+        .flatten();
+    if let Some(style) = cursor {
+        window.set_cursor_style(style, hitbox);
+    }
+    let (hitbox, layout, links) = (hitbox.clone(), layout.clone(), links.to_vec());
+    window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        let now = hitbox
+            .is_hovered(window)
+            .then(|| text_cursor(&layout, e.position, selectable, &links, clickable))
+            .flatten();
+        if now != cursor {
+            window.refresh();
+        }
+    });
 }
 
 /// Paint one run's highlight washes and log their geometry.
