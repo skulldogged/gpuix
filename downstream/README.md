@@ -50,5 +50,6 @@ GPUIX:
 - `fonts` loads font files before the window opens.
 - `<img>` files and URLs load through a bounded memory (`imageMemoryMb`,
   default 256) that drops the least recently drawn images.
+  `animated={false}` loads only the first frame of an animated file.
 - The native crate is its own Cargo workspace, so it builds inside another
   repository.

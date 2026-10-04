@@ -22,6 +22,9 @@ log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
 futures = "0.3"
+# `<img animated={false}>` decodes a first frame itself. GPUI already builds
+# this version with these formats, so it adds no compile work.
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 # The retained tree is keyed by u64 ids that JS allocates as a counter, and it
 # is probed on every `mark_changed` ancestor hop and once per child per frame in
 # `build_virtual_list`. SipHash earns nothing on those keys.

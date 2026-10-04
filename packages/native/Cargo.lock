@@ -2602,6 +2602,7 @@ dependencies = [
  "gpui_macos",
  "gpui_platform",
  "http_client",
+ "image",
  "js-sys",
  "log",
  "mimalloc",

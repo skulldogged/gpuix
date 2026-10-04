@@ -2760,6 +2760,11 @@ They are not written to a temp file.
 placeholder instead of crashing. A URL that is still loading paints an empty
 box of the declared size. There is no spinner.
 
+Animated GIF and WebP files play, and every frame is decoded up front: a
+few hundred frames of 480px art is hundreds of megabytes. `animated={false}`
+loads only the first frame. Use it for thumbnails of files that might be
+animated.
+
 `borderRadius` clips the bitmap. GPUI paints the image with those corner
 radii. A parent `overflow: "hidden"` wrapper does **not** clip an `<img>`
 child. Put the radius on the image.

@@ -535,6 +535,12 @@ export interface ImgProps extends HostProps {
   src?: string
   objectFit?: "fill" | "contain" | "cover" | "scaleDown" | "none"
   alt?: string
+  /**
+   * Default `true`. `false` shows an animated GIF or WebP as its first frame.
+   * Every frame of an animation is decoded up front and kept in memory, so a
+   * thumbnail grid of animated files can otherwise hold gigabytes.
+   */
+  animated?: boolean
 }
 
 /** Byte order of a `setImagePixels` buffer. Alpha is straight in both. */

@@ -90,6 +90,8 @@ pub struct ImgElement {
     source: ImgSource,
     object_fit: ImgObjectFit,
     alt: String,
+    /// `animated={false}`: load files and URLs as their first frame.
+    still: bool,
     dropped: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
@@ -144,7 +146,14 @@ struct ImageMemoryEntry {
     last_used: u64,
 }
 
-struct GlobalImageMemory(gpui::Entity<ImageMemory>);
+/// The image memory as `<img animated={false}>` sees it: the same entries and
+/// budget, with animated files loaded as their first frame.
+pub struct StillImages(gpui::Entity<ImageMemory>);
+
+struct GlobalImageMemory {
+    memory: gpui::Entity<ImageMemory>,
+    still: gpui::Entity<StillImages>,
+}
 
 impl gpui::Global for GlobalImageMemory {}
 
@@ -162,7 +171,10 @@ impl ImageMemory {
     /// is over budget, least recently used first. Failed loads are forgotten
     /// once unused, so a remounted image tries again.
     pub fn begin_frame(window: &mut gpui::Window, cx: &mut gpui::App) {
-        let Some(memory) = cx.try_global::<GlobalImageMemory>().map(|g| g.0.clone()) else {
+        let Some(memory) = cx
+            .try_global::<GlobalImageMemory>()
+            .map(|g| g.memory.clone())
+        else {
             return;
         };
         let evicted = memory.update(cx, |memory, _| {
@@ -209,9 +221,34 @@ impl gpui::ImageCache for ImageMemory {
         window: &mut gpui::Window,
         cx: &mut gpui::App,
     ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
+        self.load_resource(resource, false, window, cx)
+    }
+}
+
+impl gpui::ImageCache for StillImages {
+    fn load(
+        &mut self,
+        resource: &gpui::Resource,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
+        self.0.update(cx, |memory, cx| {
+            memory.load_resource(resource, true, window, cx)
+        })
+    }
+}
+
+impl ImageMemory {
+    fn load_resource(
+        &mut self,
+        resource: &gpui::Resource,
+        still: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
         use futures::FutureExt as _;
         use gpui::Asset as _;
-        let key = gpui::hash(resource);
+        let key = gpui::hash(&(resource, still));
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.frame;
             let result = entry.item.get();
@@ -224,7 +261,11 @@ impl gpui::ImageCache for ImageMemory {
             return result;
         }
 
-        let load = gpui::AssetLogger::<gpui::ImageAssetLoader>::load(resource.clone(), cx);
+        let load = if still {
+            load_still(resource.clone(), cx).boxed()
+        } else {
+            gpui::AssetLogger::<gpui::ImageAssetLoader>::load(resource.clone(), cx).boxed()
+        };
         let task = cx.background_executor().spawn(load).shared();
         self.entries.insert(
             key,
@@ -245,6 +286,69 @@ impl gpui::ImageCache for ImageMemory {
     }
 }
 
+/// Load a file or URL as a single still frame. GPUI's own loader decodes every
+/// frame of an animated GIF or WebP up front; a few hundred frames of album art
+/// is hundreds of megabytes, and the atlas then uploads each frame as it plays.
+fn load_still(
+    resource: gpui::Resource,
+    cx: &mut gpui::App,
+) -> impl std::future::Future<
+    Output = Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>,
+> + Send
+       + 'static {
+    use futures::{AsyncReadExt as _, FutureExt as _};
+    let client = cx.http_client();
+    let assets = cx.asset_source().clone();
+    let svg_renderer = cx.svg_renderer();
+    async move {
+        let bytes = match &resource {
+            gpui::Resource::Path(path) => std::fs::read(path.as_ref())?,
+            gpui::Resource::Uri(uri) => {
+                let mut response = client.get(uri.as_ref(), ().into(), true).await?;
+                let mut body = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
+                if !response.status().is_success() {
+                    return Err(gpui::ImageCacheError::BadStatus {
+                        uri: uri.clone(),
+                        status: response.status(),
+                        body: String::new(),
+                    });
+                }
+                body
+            }
+            gpui::Resource::Embedded(path) => assets
+                .load(path.as_ref())
+                .ok()
+                .flatten()
+                .map(|data| data.to_vec())
+                .ok_or_else(|| {
+                    gpui::ImageCacheError::Asset(
+                        format!("Embedded resource not found: {path}").into(),
+                    )
+                })?,
+        };
+        let Ok(format) = image::guess_format(&bytes) else {
+            // Not a raster format, so an SVG, which has no frames to skip.
+            return Ok(gpui::Image::from_bytes(gpui::ImageFormat::Svg, bytes)
+                .to_image_data(svg_renderer)?);
+        };
+        // A decoder read as a single image yields the first frame.
+        let mut pixels = image::load_from_memory_with_format(&bytes, format)?.into_rgba8();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let (width, height) = pixels.dimensions();
+        gpui::RenderImage::from_bgra(width, height, pixels.into_raw())
+            .map(std::sync::Arc::new)
+            .ok_or_else(|| anyhow::anyhow!("decoded image does not match its size").into())
+    }
+    .inspect(move |result| {
+        if let Err(error) = result {
+            log::error!("{error}");
+        }
+    })
+}
+
 /// Install the GPUI HTTP client so `<img src="https://…">` can fetch, and the
 /// image memory every `<img>` loads through. `budget_mb` bounds the decoded
 /// images kept while not on screen.
@@ -260,7 +364,8 @@ pub fn init(cx: &mut gpui::App, budget_mb: Option<f64>) {
         used: 0,
         frame: 0,
     });
-    cx.set_global(GlobalImageMemory(memory));
+    let still = cx.new(|_| StillImages(memory.clone()));
+    cx.set_global(GlobalImageMemory { memory, still });
     #[cfg(not(target_family = "wasm"))]
     match reqwest_client::ReqwestClient::user_agent("gpuix") {
         Ok(client) => cx.set_http_client(std::sync::Arc::new(client)),
@@ -336,7 +441,8 @@ impl CustomElement for ImgElement {
         // Files and URLs load through the bounded image memory; data and
         // pixel sources are owned by this element already.
         let el = match _cx.try_global::<GlobalImageMemory>() {
-            Some(memory) => el.image_cache(&memory.0),
+            Some(memory) if self.still => el.image_cache(&memory.still),
+            Some(memory) => el.image_cache(&memory.memory),
             None => el,
         };
         // The id is what makes gpui's `ImgState` persist. Without it `Img` has no
@@ -400,12 +506,13 @@ impl CustomElement for ImgElement {
                     .unwrap_or_default()
             }
             "alt" => self.alt = value.as_str().unwrap_or_default().to_string(),
+            "animated" => self.still = value.as_bool() == Some(false),
             _ => {}
         }
     }
 
     fn supported_props(&self) -> &'static [&'static str] {
-        &["src", "objectFit", "alt"]
+        &["src", "objectFit", "alt", "animated"]
     }
 
     fn supported_events(&self) -> &'static [&'static str] {
