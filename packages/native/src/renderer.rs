@@ -5050,6 +5050,10 @@ pub(crate) fn build_element(
                 selection_wash: inherited.selection_wash,
                 highlight_set: inherited.highlight.clone(),
                 props: &element.custom_props,
+                hover_transition: element
+                    .style
+                    .as_deref()
+                    .is_some_and(crate::motion::hover_is_animatable),
             };
             ctx.custom_registry
                 .render(custom_type, &element.custom_props, render_ctx, window, cx)

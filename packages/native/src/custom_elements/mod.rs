@@ -57,6 +57,10 @@ pub struct CustomRenderContext<'a> {
     pub highlight_set: Option<std::sync::Arc<crate::text::HighlightContext>>,
     /// Retained custom props, including `role` and `aria-*`.
     pub props: &'a HashMap<String, serde_json::Value>,
+    /// The declared `hover` has colors or opacity that ease in and out. They
+    /// are already removed from `style.hover`, so the element must report its
+    /// hover edges to `crate::motion::set_hovered` or it never highlights.
+    pub hover_transition: bool,
 }
 
 impl CustomRenderContext<'_> {
@@ -152,6 +156,15 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
     ctx: &CustomRenderContext,
 ) -> E {
     let id = ctx.id;
+    let transition = ctx.hover_transition;
+    // GPUI has one hover listener per element; the enter/leave wiring below
+    // also tracks hover transitions, so this covers elements without it.
+    if transition && !ctx.events.contains("mouseEnter") && !ctx.events.contains("mouseLeave") {
+        el = el.on_hover(move |&hovered, window, _cx| {
+            crate::motion::set_hovered(id, hovered);
+            window.refresh();
+        });
+    }
     for event in ctx.events {
         let callback = ctx.event_callback.clone();
         match event.as_str() {
@@ -176,7 +189,11 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
                     let enter = ctx.events.contains("mouseEnter");
                     let leave = ctx.events.contains("mouseLeave");
                     let callback = ctx.event_callback.clone();
-                    el = el.on_hover(move |&hovered, _window, _cx| {
+                    el = el.on_hover(move |&hovered, window, _cx| {
+                        if transition {
+                            crate::motion::set_hovered(id, hovered);
+                            window.refresh();
+                        }
                         let kind = if hovered { "mouseEnter" } else { "mouseLeave" };
                         if (hovered && enter) || (!hovered && leave) {
                             crate::renderer::emit_event_full(&callback, id, kind, |p| {
