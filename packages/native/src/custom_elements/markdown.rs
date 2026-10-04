@@ -152,10 +152,9 @@ impl CustomElement for MarkdownElement {
             self.veil = Some(veil);
         }
 
+        // Block layout, like the document inside it; see `render::stack`.
         let container = gpui::div()
             .id(SharedString::from(format!("__gpuix_markdown_{}", ctx.id)))
-            .flex()
-            .flex_col()
             .w_full()
             .min_w_0()
             .text_color(theme.text)

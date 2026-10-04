@@ -320,17 +320,31 @@ pub fn render_tree(tree: &BlockTree, ctx: &mut MdContext, window: &Window) -> An
     use gpui::prelude::*;
 
     let block_gap = ctx.theme.metrics.md_block_gap;
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(block_gap))
-        .children(
-            tree.blocks
-                .iter()
-                .map(|block| render_block(block, ctx, window))
-                .collect::<Vec<_>>(),
-        )
-        .into_any_element()
+    stack(
+        tree.blocks
+            .iter()
+            .map(|block| render_block(block, ctx, window))
+            .collect::<Vec<_>>(),
+        block_gap,
+    )
+    .into_any_element()
+}
+
+/// Children one above the other, `gap` apart, in block layout. A flex column
+/// lays each child out again to size it, and markdown nests these (lists in
+/// quotes in lists), so every level multiplied the text a frame lays out;
+/// block layout lays a child out once for the width it gets. Padding rather
+/// than margin keeps the spacing clear of margin collapsing.
+fn stack(children: Vec<AnyElement>, gap: f32) -> gpui::Div {
+    use gpui::prelude::*;
+
+    div().children(children.into_iter().enumerate().map(|(i, child)| {
+        if i == 0 {
+            child
+        } else {
+            div().pt(px(gap)).child(child).into_any_element()
+        }
+    }))
 }
 
 pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyElement {
@@ -351,33 +365,30 @@ pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyE
             text_element(runs, size, line, FontWeight::SEMIBOLD, ctx)
         }
         Block::CodeBlock { language, code } => render_code_block(language.as_deref(), code, ctx),
-        Block::BlockQuote { children } => div()
-            // Accent-tinted quote: an indigo rail with a whisper of the same
-            // hue behind it.
-            .border_l_2()
-            .border_color(opacity(theme.accent, 0.6))
-            .bg(opacity(theme.accent, 0.05))
-            .rounded_tr(px(6.0))
-            .rounded_br(px(6.0))
-            .pl(px(12.0))
-            .pr(px(10.0))
-            .py(px(6.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .text_color(theme.text_muted)
-            .children(
-                children
-                    .iter()
-                    .map(|child| render_block(child, ctx, window))
-                    .collect::<Vec<_>>(),
-            )
-            .into_any_element(),
+        Block::BlockQuote { children } => stack(
+            children
+                .iter()
+                .map(|child| render_block(child, ctx, window))
+                .collect::<Vec<_>>(),
+            8.0,
+        )
+        // Accent-tinted quote: an indigo rail with a whisper of the same
+        // hue behind it.
+        .border_l_2()
+        .border_color(opacity(theme.accent, 0.6))
+        .bg(opacity(theme.accent, 0.05))
+        .rounded_tr(px(6.0))
+        .rounded_br(px(6.0))
+        .pl(px(12.0))
+        .pr(px(10.0))
+        .py(px(6.0))
+        .text_color(theme.text_muted)
+        .into_any_element(),
         Block::List {
             ordered_start,
             items,
         } => {
-            let mut list = div().flex().flex_col().gap(px(4.0));
+            let mut rows = Vec::with_capacity(items.len());
             for (item_ix, item) in items.iter().enumerate() {
                 // Ordered numbers are accent-tinted text; unordered markers are
                 // a real 5px disc, because the glyph "•" reads too small at 14px.
@@ -414,19 +425,17 @@ pub fn render_block(block: &Block, ctx: &mut MdContext, window: &Window) -> AnyE
                     .iter()
                     .map(|child| render_block(child, ctx, window))
                     .collect();
-                list = list.child(
-                    div().flex().flex_row().gap(px(8.0)).child(marker).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .children(children),
-                    ),
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .child(marker)
+                        .child(stack(children, 4.0).flex_1().min_w_0())
+                        .into_any_element(),
                 );
             }
-            list.into_any_element()
+            stack(rows, 4.0).into_any_element()
         }
         Block::Table {
             header,
@@ -670,9 +679,8 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
     // and a horizontal wheel does nothing. Same pattern as host overflowX.
     let wrap = ctx.code_wrap;
     let scroll_sub = ctx.take_sub();
+    // Rows stack in block layout; see `stack`.
     let lines = div()
-        .flex()
-        .flex_col()
         .px(px(m.md_code_padding_x))
         .py(px(m.md_code_padding_y))
         .font_family(theme.font_mono.clone())
