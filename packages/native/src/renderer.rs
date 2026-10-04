@@ -5696,6 +5696,11 @@ where
     }
     // `focusVisible` needs the focus handle, so `apply_focus_visible` applies
     // it where the element calls track_focus.
+    if let Some(drag_over_style) = style.drag_over.clone() {
+        el = el.drag_over::<gpui::ExternalPaths>(move |refinement, _, _, _| {
+            apply_styles(refinement, &drag_over_style)
+        });
+    }
     el
 }
 

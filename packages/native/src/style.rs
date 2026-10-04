@@ -243,6 +243,8 @@ pub struct StyleDesc {
     /// `false` keeps this element at full opacity while another control has
     /// keyboard focus. Not inherited.
     pub keyboard_focus_dim: Option<bool>,
+    /// Applied while files dragged from the OS are over the element.
+    pub drag_over: Option<Box<StyleDesc>>,
 }
 
 pub use crate::color::{parse_color, parse_color_hex};
