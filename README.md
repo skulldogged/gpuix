@@ -2758,6 +2758,22 @@ Set **both** `width` and `height`. GPUI fetches and decodes on a background
 task. The tree does not wait. Without a definite size the box is empty until
 decode, then jumps to the bitmap size.
 
+GPUI scales a bitmap on the GPU without mipmaps, so one a few times larger
+than its box aliases. Fetch images at the size they are drawn where you can,
+and pass `decodeWidth` and `decodeHeight`, in device pixels, for any that may
+arrive larger. A file or URL with more pixels than it needs to fill that box
+for its `objectFit` is shrunk once, on the background task that decodes it.
+
+```tsx
+<img
+  src={`${server}/cover?size=${48 * scale}`}
+  decodeWidth={48 * scale}
+  decodeHeight={48 * scale}
+  objectFit="cover"
+  style={{ width: 48, height: 48 }}
+/>
+```
+
 Data URLs support every image format listed above. Base64 and percent-encoded
 payloads are accepted. Remote URLs use the same GPUI image cache as disk files.
 They are not written to a temp file.
@@ -2765,7 +2781,9 @@ They are not written to a temp file.
 `objectFit` matches CSS: `"contain"` (default), `"cover"`, `"fill"`,
 `"scaleDown"`, or `"none"`. An empty `src` or a failed load shows a fallback
 placeholder instead of crashing. A URL that is still loading paints an empty
-box of the declared size. There is no spinner.
+box of the declared size. There is no spinner. When `src` changes to another
+file or URL, the image already drawn stays until the new one has loaded, as in
+a browser.
 
 Animated GIF and WebP files play, and every frame is decoded up front: a
 few hundred frames of 480px art is hundreds of megabytes. `animated={false}`

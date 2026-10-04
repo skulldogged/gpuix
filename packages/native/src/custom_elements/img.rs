@@ -37,7 +37,7 @@ impl CustomElementFactory for ImgFactory {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ImgObjectFit {
     Fill,
     Contain,
@@ -92,6 +92,12 @@ pub struct ImgElement {
     alt: String,
     /// `animated={false}`: load files and URLs as their first frame.
     still: bool,
+    /// `decodeWidth` and `decodeHeight`, in device pixels.
+    decode_width: Option<u32>,
+    decode_height: Option<u32>,
+    /// The image memory key of the file or URL this element last drew, which
+    /// stands in while a new `src` loads.
+    shown: std::rc::Rc<std::cell::Cell<Option<u64>>>,
     dropped: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
@@ -112,7 +118,146 @@ impl ImgElement {
         } else {
             ImgSource::Path(src.into())
         };
+        if !matches!(self.source, ImgSource::Path(_) | ImgSource::Uri(_)) {
+            self.shown.set(None);
+        }
     }
+
+    /// Files and URLs load through the bounded image memory; data and pixel
+    /// sources are owned by this element already.
+    fn load_resource(&self, resource: gpui::Resource, cx: &gpui::App) -> gpui::Img {
+        let Some(memory) = cx.try_global::<GlobalImageMemory>() else {
+            return gpui::img(gpui::ImageSource::Resource(resource));
+        };
+        let memory = memory.0.clone();
+        let load = Load {
+            still: self.still,
+            decode: self.decode(),
+        };
+        let shown = self.shown.clone();
+        gpui::img(move |window: &mut gpui::Window, cx: &mut gpui::App| {
+            memory.update(cx, |memory, cx| {
+                memory.load_for(&resource, load, &shown, window, cx)
+            })
+        })
+    }
+
+    fn decode(&self) -> Option<Decode> {
+        Some(Decode {
+            width: self.decode_width?,
+            height: self.decode_height?,
+            fit: self.object_fit,
+        })
+    }
+}
+
+/// How a file or URL is decoded. Part of its key in the image memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Load {
+    still: bool,
+    decode: Option<Decode>,
+}
+
+/// `decodeWidth` and `decodeHeight`: the most device pixels a bitmap needs to
+/// fill its box for `objectFit`.
+///
+/// GPUI uploads a bitmap at its own size and the GPU scales it into the box
+/// with one bilinear sample per pixel and no mipmaps, so a bitmap a few times
+/// larger than its box aliases. One larger than this is shrunk once, as it
+/// decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Decode {
+    width: u32,
+    height: u32,
+    fit: ImgObjectFit,
+}
+
+impl Decode {
+    /// The size to shrink a `width` by `height` bitmap to, or `None` when it
+    /// has no more pixels than it needs.
+    fn size(self, width: u32, height: u32) -> Option<[u32; 2]> {
+        let (width, height) = (width as f64, height as f64);
+        let x = self.width as f64 / width;
+        let y = self.height as f64 / height;
+        let (x, y) = match self.fit {
+            ImgObjectFit::Fill => (x.min(1.0), y.min(1.0)),
+            ImgObjectFit::Cover => (x.max(y), x.max(y)),
+            ImgObjectFit::Contain | ImgObjectFit::ScaleDown | ImgObjectFit::None => {
+                (x.min(y), x.min(y))
+            }
+        };
+        let side = |length: f64, scale: f64| ((length * scale).round() as u32).max(1);
+        (x < 1.0 || y < 1.0).then(|| [side(width, x), side(height, y)])
+    }
+
+    /// Every frame of `image` shrunk to what it needs. One no larger, or one
+    /// whose frames differ in size, is returned as it is.
+    fn shrink(self, image: std::sync::Arc<gpui::RenderImage>) -> std::sync::Arc<gpui::RenderImage> {
+        let size = image.size(0);
+        let (width, height) = (u32::from(size.width), u32::from(size.height));
+        let Some([to_width, to_height]) = self.size(width, height) else {
+            return image;
+        };
+        let frames: Option<Vec<image::Frame>> = (0..image.frame_count())
+            .map(|index| {
+                if image.size(index) != size {
+                    return None;
+                }
+                let pixels = image.as_bytes(index)?;
+                let shrunk = resize_pixels(pixels, width, height, to_width, to_height)?;
+                Some(image::Frame::from_parts(shrunk, 0, 0, image.delay(index)))
+            })
+            .collect();
+        match frames {
+            Some(frames) if !frames.is_empty() => {
+                std::sync::Arc::new(gpui::RenderImage::new(frames))
+            }
+            _ => image,
+        }
+    }
+}
+
+/// Resize packed pixels with a Lanczos filter. Channel order does not matter
+/// as long as alpha is last, which holds for GPUI's BGRA. Straight alpha is
+/// premultiplied around the filter, or the colors of fully transparent pixels
+/// would bleed into the edges of what is visible.
+fn resize_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    to_width: u32,
+    to_height: u32,
+) -> Option<image::RgbaImage> {
+    use image::imageops::{resize, FilterType};
+    let filter = FilterType::Lanczos3;
+    if pixels.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX) {
+        let source = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(width, height, pixels)?;
+        return Some(resize(&source, to_width, to_height, filter));
+    }
+    let mut source = image::RgbaImage::from_raw(width, height, pixels.to_vec())?;
+    for pixel in source.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u16;
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u16 * alpha + 127) / 255) as u8;
+        }
+    }
+    let mut resampled = resize(&source, to_width, to_height, filter);
+    for pixel in resampled.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u16;
+        if alpha > 0 && alpha < 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((*channel as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    Some(resampled)
+}
+
+fn decode_pixels(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_f64()
+        .filter(|pixels| *pixels >= 1.0)
+        .map(|pixels| pixels.round() as u32)
 }
 
 fn http_image_uri(src: &str) -> Option<gpui::SharedUri> {
@@ -146,14 +291,7 @@ struct ImageMemoryEntry {
     last_used: u64,
 }
 
-/// The image memory as `<img animated={false}>` sees it: the same entries and
-/// budget, with animated files loaded as their first frame.
-pub struct StillImages(gpui::Entity<ImageMemory>);
-
-struct GlobalImageMemory {
-    memory: gpui::Entity<ImageMemory>,
-    still: gpui::Entity<StillImages>,
-}
+struct GlobalImageMemory(gpui::Entity<ImageMemory>);
 
 impl gpui::Global for GlobalImageMemory {}
 
@@ -171,10 +309,7 @@ impl ImageMemory {
     /// is over budget, least recently used first. Failed loads are forgotten
     /// once unused, so a remounted image tries again.
     pub fn begin_frame(window: &mut gpui::Window, cx: &mut gpui::App) {
-        let Some(memory) = cx
-            .try_global::<GlobalImageMemory>()
-            .map(|g| g.memory.clone())
-        else {
+        let Some(memory) = cx.try_global::<GlobalImageMemory>().map(|g| g.0.clone()) else {
             return;
         };
         let evicted = memory.update(cx, |memory, _| {
@@ -214,41 +349,44 @@ impl ImageMemory {
     }
 }
 
-impl gpui::ImageCache for ImageMemory {
-    fn load(
-        &mut self,
-        resource: &gpui::Resource,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
-        self.load_resource(resource, false, window, cx)
-    }
-}
-
-impl gpui::ImageCache for StillImages {
-    fn load(
-        &mut self,
-        resource: &gpui::Resource,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
-        self.0.update(cx, |memory, cx| {
-            memory.load_resource(resource, true, window, cx)
-        })
-    }
-}
-
 impl ImageMemory {
-    fn load_resource(
+    /// A file or URL for one `<img>`. Until a new `src` has loaded, the image
+    /// the element drew last stands in, as a browser keeps showing an `<img>`
+    /// until its new `src` is ready.
+    fn load_for(
         &mut self,
         resource: &gpui::Resource,
-        still: bool,
+        load: Load,
+        shown: &std::cell::Cell<Option<u64>>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
+        let key = gpui::hash(&(resource, load));
+        match self.load(key, resource, load, window, cx) {
+            None => {
+                let entry = self.entries.get_mut(&shown.get()?)?;
+                entry.last_used = self.frame;
+                entry.item.get()
+            }
+            result => {
+                if let Some(Ok(_)) = result {
+                    shown.set(Some(key));
+                }
+                result
+            }
+        }
+    }
+
+    fn load(
+        &mut self,
+        key: u64,
+        resource: &gpui::Resource,
+        load: Load,
         window: &mut gpui::Window,
         cx: &mut gpui::App,
     ) -> Option<Result<std::sync::Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
         use futures::FutureExt as _;
         use gpui::Asset as _;
-        let key = gpui::hash(&(resource, still));
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.frame;
             let result = entry.item.get();
@@ -261,12 +399,21 @@ impl ImageMemory {
             return result;
         }
 
-        let load = if still {
+        let image = if load.still {
             load_still(resource.clone(), cx).boxed()
         } else {
             gpui::AssetLogger::<gpui::ImageAssetLoader>::load(resource.clone(), cx).boxed()
         };
-        let task = cx.background_executor().spawn(load).shared();
+        let task = cx
+            .background_executor()
+            .spawn(async move {
+                let image = image.await?;
+                Ok::<_, gpui::ImageCacheError>(match load.decode {
+                    Some(decode) => decode.shrink(image),
+                    None => image,
+                })
+            })
+            .shared();
         self.entries.insert(
             key,
             ImageMemoryEntry {
@@ -364,8 +511,7 @@ pub fn init(cx: &mut gpui::App, budget_mb: Option<f64>) {
         used: 0,
         frame: 0,
     });
-    let still = cx.new(|_| StillImages(memory.clone()));
-    cx.set_global(GlobalImageMemory { memory, still });
+    cx.set_global(GlobalImageMemory(memory));
     #[cfg(not(target_family = "wasm"))]
     match reqwest_client::ReqwestClient::user_agent("gpuix") {
         Ok(client) => cx.set_http_client(std::sync::Arc::new(client)),
@@ -431,19 +577,14 @@ impl CustomElement for ImgElement {
         }
 
         let el = match &self.source {
-            ImgSource::Path(path) => gpui::img(path.clone()),
-            ImgSource::Uri(uri) => gpui::img(uri.clone()),
+            ImgSource::Path(path) => {
+                self.load_resource(gpui::Resource::Path(path.as_path().into()), _cx)
+            }
+            ImgSource::Uri(uri) => self.load_resource(gpui::Resource::Uri(uri.clone()), _cx),
             ImgSource::Data(image) => gpui::img(image.clone()),
             ImgSource::Render(image) => gpui::img(image.clone()),
             ImgSource::Empty => return img_fallback(&ctx, &self.alt, "img: no src"),
             ImgSource::Invalid => return img_fallback(&ctx, &self.alt, "img: load failed"),
-        };
-        // Files and URLs load through the bounded image memory; data and
-        // pixel sources are owned by this element already.
-        let el = match _cx.try_global::<GlobalImageMemory>() {
-            Some(memory) if self.still => el.image_cache(&memory.still),
-            Some(memory) => el.image_cache(&memory.memory),
-            None => el,
         };
         // The id is what makes gpui's `ImgState` persist. Without it `Img` has no
         // `GlobalElementId`, so the animated-GIF frame index and the delayed
@@ -507,12 +648,21 @@ impl CustomElement for ImgElement {
             }
             "alt" => self.alt = value.as_str().unwrap_or_default().to_string(),
             "animated" => self.still = value.as_bool() == Some(false),
+            "decodeWidth" => self.decode_width = decode_pixels(&value),
+            "decodeHeight" => self.decode_height = decode_pixels(&value),
             _ => {}
         }
     }
 
     fn supported_props(&self) -> &'static [&'static str] {
-        &["src", "objectFit", "alt", "animated"]
+        &[
+            "src",
+            "objectFit",
+            "alt",
+            "animated",
+            "decodeWidth",
+            "decodeHeight",
+        ]
     }
 
     fn supported_events(&self) -> &'static [&'static str] {

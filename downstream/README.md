@@ -58,5 +58,7 @@ GPUIX:
 - `<img>` files and URLs load through a bounded memory (`imageMemoryMb`,
   default 256) that drops the least recently drawn images.
   `animated={false}` loads only the first frame of an animated file.
+  `decodeWidth`/`decodeHeight` shrink a bitmap larger than it is drawn once,
+  as it decodes, and a changed `src` keeps the old image until the new loads.
 - The native crate is its own Cargo workspace, so it builds inside another
   repository.

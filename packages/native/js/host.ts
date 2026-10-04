@@ -541,6 +541,13 @@ export interface ImgProps extends HostProps {
    * thumbnail grid of animated files can otherwise hold gigabytes.
    */
   animated?: boolean
+  /**
+   * The most device pixels the bitmap needs to fill this box for `objectFit`.
+   * Set both. A file or URL larger than that is shrunk once as it decodes;
+   * the GPU scales without mipmaps, so a much larger bitmap aliases.
+   */
+  decodeWidth?: number
+  decodeHeight?: number
 }
 
 /** Byte order of a `setImagePixels` buffer. Alpha is straight in both. */
