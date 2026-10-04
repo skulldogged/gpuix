@@ -173,6 +173,11 @@ pub struct MdContext {
     /// Called with the URL of the link under a click. Hit testing happens per
     /// byte range inside the painted text, not per block.
     pub on_link: Option<Arc<dyn Fn(&str)>>,
+    /// Wrap long code lines instead of scrolling them sideways.
+    pub code_wrap: bool,
+    /// Present when the host lets the reader toggle `code_wrap`; adds a Wrap
+    /// control to each code block header.
+    pub on_code_wrap: Option<Arc<dyn Fn()>>,
 }
 
 impl MdContext {
@@ -194,6 +199,8 @@ impl MdContext {
             highlight_set,
             next_sub: 0,
             on_link,
+            code_wrap: false,
+            on_code_wrap: None,
         }
     }
 
@@ -404,6 +411,58 @@ fn flat_text_element(flat: &FlatText, ctx: &mut MdContext) -> AnyElement {
     })
 }
 
+/// The name a reader knows for a fence's language ID, like "TypeScript" for
+/// `ts`. Unknown IDs are shown as written.
+fn language_name(id: &str) -> String {
+    let name = match id.to_ascii_lowercase().as_str() {
+        "ts" | "typescript" => "TypeScript",
+        "tsx" => "TSX",
+        "js" | "javascript" | "mjs" | "cjs" => "JavaScript",
+        "jsx" => "JSX",
+        "rs" | "rust" => "Rust",
+        "py" | "python" => "Python",
+        "sh" | "shell" => "Shell",
+        "bash" => "Bash",
+        "zsh" => "Zsh",
+        "fish" => "Fish",
+        "ps" | "ps1" | "powershell" | "pwsh" => "PowerShell",
+        "bat" | "cmd" => "Batch",
+        "console" | "shell-session" => "Terminal",
+        "json" => "JSON",
+        "jsonc" => "JSON with comments",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "ini" => "INI",
+        "md" | "markdown" => "Markdown",
+        "html" => "HTML",
+        "xml" => "XML",
+        "svg" => "SVG",
+        "css" => "CSS",
+        "scss" => "SCSS",
+        "go" | "golang" => "Go",
+        "c" => "C",
+        "h" => "C header",
+        "cpp" | "c++" | "cc" | "hpp" => "C++",
+        "cs" | "csharp" => "C#",
+        "java" => "Java",
+        "kt" | "kotlin" => "Kotlin",
+        "swift" => "Swift",
+        "rb" | "ruby" => "Ruby",
+        "php" => "PHP",
+        "lua" => "Lua",
+        "sql" => "SQL",
+        "graphql" | "gql" => "GraphQL",
+        "diff" | "patch" => "Diff",
+        "dockerfile" | "docker" => "Dockerfile",
+        "make" | "makefile" => "Makefile",
+        "nix" => "Nix",
+        "zig" => "Zig",
+        "txt" | "text" | "plain" | "plaintext" => "Plain text",
+        _ => return id.to_string(),
+    };
+    name.to_string()
+}
+
 fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) -> AnyElement {
     use gpui::prelude::*;
 
@@ -415,17 +474,23 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
     // overflow-x only works as a flex *row* viewport. A flex_col scroller
     // stretches each nowrap row to the card width, so the line never overflows
     // and a horizontal wheel does nothing. Same pattern as host overflowX.
+    let wrap = ctx.code_wrap;
     let scroll_sub = ctx.take_sub();
-    let mut lines = div()
-        .flex_none()
+    let lines = div()
         .flex()
         .flex_col()
         .px(px(m.md_code_padding_x))
         .py(px(m.md_code_padding_y))
         .font_family(theme.font_mono.clone())
         .text_size(px(m.code_text_size))
-        .line_height(px(m.code_line_height))
-        .whitespace_nowrap();
+        .line_height(px(m.code_line_height));
+    // Wrapped lines take the card's width and grow in height; unwrapped lines
+    // keep their natural width inside the horizontal scroller.
+    let mut lines = if wrap {
+        lines.w_full().min_w_0().whitespace_normal()
+    } else {
+        lines.flex_none().whitespace_nowrap()
+    };
 
     for (line_ix, line) in code.split('\n').enumerate() {
         let spans: Vec<(Range<usize>, Hsla)> = highlight
@@ -457,7 +522,12 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
                 ctx.selection_wash,
             )
         });
-        lines = lines.child(div().h(px(m.code_line_height)).flex_none().child(text));
+        let row = if wrap {
+            div().min_h(px(m.code_line_height)).w_full().min_w_0()
+        } else {
+            div().h(px(m.code_line_height)).flex_none()
+        };
+        lines = lines.child(row.child(text));
     }
 
     let body = div()
@@ -466,10 +536,14 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
             ctx.element_id
         )))
         .flex()
-        .min_w_0()
-        .overflow_x_scroll()
-        .restrict_scroll_to_axis()
-        .child(lines);
+        .min_w_0();
+    let body = if wrap {
+        body.child(lines)
+    } else {
+        body.overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .child(lines)
+    };
 
     let mut block = div()
         .w_full()
@@ -480,21 +554,45 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
         .border_color(theme.border)
         .overflow_hidden();
 
-    if let Some(language) = language {
-        block = block.child(
-            div()
-                .px(px(m.md_code_padding_x))
-                .py(px(m.md_code_header_padding_y))
-                .border_b_1()
-                .border_color(theme.border)
-                .bg(ink(&theme, 0.02))
-                .text_size(px(m.md_code_header_text_size))
-                .text_color(theme.text_muted)
-                .child(crate::text::chrome_text(
-                    SharedString::from(language.to_string()),
-                    None,
-                )),
-        );
+    if language.is_some() || ctx.on_code_wrap.is_some() {
+        let mut header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(m.md_code_padding_x))
+            .py(px(m.md_code_header_padding_y))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(ink(&theme, 0.02))
+            .text_size(px(m.md_code_header_text_size))
+            .text_color(theme.text_muted)
+            .child(crate::text::chrome_text(
+                SharedString::from(language_name(language.unwrap_or_default())),
+                None,
+            ));
+        if let Some(toggle) = ctx.on_code_wrap.clone() {
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "__gpuix_md_wrap_{}_{scroll_sub}",
+                        ctx.element_id
+                    )))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .when(wrap, |d| d.bg(ink(&theme, 0.06)).text_color(theme.text))
+                    .hover(|d| d.bg(ink(&theme, 0.08)))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        toggle();
+                    })
+                    .child(crate::text::chrome_text(
+                        SharedString::from(if wrap { "Wrapped" } else { "Wrap" }),
+                        None,
+                    )),
+            );
+        }
+        block = block.child(header);
     }
 
     block.child(body).into_any_element()

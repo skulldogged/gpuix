@@ -19,6 +19,9 @@ use crate::markdown::render::{render_tree, MdContext};
 use crate::renderer::emit_event_full;
 use crate::theme::Theme;
 
+/// `linkClick` value sent by a code block's Wrap control.
+pub const CODE_WRAP_TOGGLE: &str = "gpuix:toggle-code-wrap";
+
 pub struct MarkdownFactory;
 
 impl CustomElementFactory for MarkdownFactory {
@@ -40,6 +43,7 @@ pub struct MarkdownElement {
     tree: Option<Rc<BlockTree>>,
     parsed_len: Option<usize>,
     parsed_hash: Option<u64>,
+    code_wrap: bool,
 }
 
 impl MarkdownElement {
@@ -90,6 +94,11 @@ impl CustomElement for MarkdownElement {
             None
         };
 
+        // The wrap toggle reports through linkClick with a reserved value, so a
+        // host needs no new event: it flips `codeWrap` and renders again.
+        let on_code_wrap: Option<Arc<dyn Fn()>> = on_link
+            .clone()
+            .map(|link| Arc::new(move || link(CODE_WRAP_TOGGLE)) as Arc<dyn Fn()>);
         let mut md = MdContext::new(
             ctx.id,
             ctx.selection.clone(),
@@ -99,6 +108,8 @@ impl CustomElement for MarkdownElement {
             on_link,
             ctx.highlight_set.clone(),
         );
+        md.code_wrap = self.code_wrap;
+        md.on_code_wrap = on_code_wrap;
         let body = render_tree(&tree, &mut md, window);
 
         let container = gpui::div()
@@ -121,12 +132,13 @@ impl CustomElement for MarkdownElement {
         match key {
             "source" => self.source = value.as_str().unwrap_or("").to_string(),
             "theme" => self.theme = Theme::from_prop(Some(&value)),
+            "codeWrap" => self.code_wrap = value.as_bool().unwrap_or(false),
             _ => {}
         }
     }
 
     fn supported_props(&self) -> &'static [&'static str] {
-        &["source", "theme"]
+        &["source", "theme", "codeWrap"]
     }
 
     fn supported_events(&self) -> &'static [&'static str] {
