@@ -183,6 +183,8 @@ pub struct MdContext {
     /// Present when the host lets the reader toggle `code_wrap`; adds a Wrap
     /// control to each code block header.
     pub on_code_wrap: Option<Arc<dyn Fn()>>,
+    /// Present while the document streams: text it gains fades in.
+    pub veil: Option<super::veil::Veil>,
 }
 
 impl MdContext {
@@ -206,6 +208,7 @@ impl MdContext {
             on_link,
             code_wrap: false,
             on_code_wrap: None,
+            veil: None,
         }
     }
 
@@ -213,6 +216,14 @@ impl MdContext {
         let sub = self.next_sub;
         self.next_sub += 1;
         sub
+    }
+
+    /// `runs` for piece `sub`, with any text it just gained fading in.
+    fn veiled(&mut self, sub: usize, text: &str, runs: Vec<TextRun>) -> Vec<TextRun> {
+        match &mut self.veil {
+            Some(veil) => veil.runs(sub, text, runs),
+            None => runs,
+        }
     }
 }
 
@@ -370,6 +381,7 @@ fn text_element(
 /// Selectable text with the inline-code wash painted underneath.
 fn flat_text_element(flat: &FlatText, ctx: &mut MdContext) -> AnyElement {
     let sub = ctx.take_sub();
+    let runs = ctx.veiled(sub, &flat.text, flat.runs.clone());
     let code_ranges = flat.code_ranges.clone();
     let wash = ctx.theme.code_wash;
     let radius = ctx.theme.metrics.md_inline_code_radius;
@@ -409,7 +421,7 @@ fn flat_text_element(flat: &FlatText, ctx: &mut MdContext) -> AnyElement {
             ctx.element_id,
             sub,
             flat.text.clone(),
-            Some(flat.runs.clone()),
+            Some(runs),
             ctx.selection.clone(),
             ctx.selection_wash,
         )
@@ -510,6 +522,7 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
             .unwrap_or_default();
         let runs = runs_for_spans(line, &spans, &mono, theme.text);
         let sub = ctx.take_sub();
+        let runs = ctx.veiled(sub, line, runs);
         // Content, not chrome: `userSelect: "none"` stops the drag, not the
         // find, and `chrome_text` cannot paint a highlight wash.
         let text: AnyElement = crate::text::selectable_text(crate::text::SelectableText {

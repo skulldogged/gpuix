@@ -16,6 +16,7 @@ use gpui::SharedString;
 use super::{CustomElement, CustomElementFactory, CustomRenderContext};
 use crate::markdown::parser::{parse, BlockTree};
 use crate::markdown::render::{render_tree, MdContext};
+use crate::markdown::veil::Veil;
 use crate::renderer::emit_event_full;
 use crate::theme::Theme;
 
@@ -44,6 +45,9 @@ pub struct MarkdownElement {
     parsed_len: Option<usize>,
     parsed_hash: Option<u64>,
     code_wrap: bool,
+    /// Set while the source is still arriving; see [`Veil`].
+    streaming: bool,
+    veil: Option<Veil>,
 }
 
 impl MarkdownElement {
@@ -110,7 +114,19 @@ impl CustomElement for MarkdownElement {
         );
         md.code_wrap = self.code_wrap;
         md.on_code_wrap = on_code_wrap;
+        md.veil = if self.streaming {
+            Some(self.veil.take().unwrap_or_default())
+        } else {
+            None
+        };
         let body = render_tree(&tree, &mut md, window);
+        if let Some(mut veil) = md.veil.take() {
+            veil.finish_frame();
+            if std::mem::take(&mut veil.animating) {
+                window.request_animation_frame();
+            }
+            self.veil = Some(veil);
+        }
 
         let container = gpui::div()
             .id(SharedString::from(format!("__gpuix_markdown_{}", ctx.id)))
@@ -133,12 +149,18 @@ impl CustomElement for MarkdownElement {
             "source" => self.source = value.as_str().unwrap_or("").to_string(),
             "theme" => self.theme = Theme::from_prop(Some(&value)),
             "codeWrap" => self.code_wrap = value.as_bool().unwrap_or(false),
+            "streaming" => {
+                self.streaming = value.as_bool().unwrap_or(false);
+                if !self.streaming {
+                    self.veil = None;
+                }
+            }
             _ => {}
         }
     }
 
     fn supported_props(&self) -> &'static [&'static str] {
-        &["source", "theme", "codeWrap"]
+        &["source", "theme", "codeWrap", "streaming"]
     }
 
     fn supported_events(&self) -> &'static [&'static str] {
