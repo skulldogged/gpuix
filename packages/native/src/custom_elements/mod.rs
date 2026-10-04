@@ -61,6 +61,8 @@ pub struct CustomRenderContext<'a> {
     /// are already removed from `style.hover`, so the element must report its
     /// hover edges to `crate::motion::set_hovered` or it never highlights.
     pub hover_transition: bool,
+    /// The view the element paints in; hover changes notify it.
+    pub view: gpui::EntityId,
 }
 
 impl CustomRenderContext<'_> {
@@ -159,12 +161,13 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
 ) -> E {
     let id = ctx.id;
     let transition = ctx.hover_transition;
+    let view = ctx.view;
     // GPUI has one hover listener per element; the enter/leave wiring below
     // also tracks hover transitions, so this covers elements without it.
     if transition && !ctx.events.contains("mouseEnter") && !ctx.events.contains("mouseLeave") {
-        el = el.on_hover(move |&hovered, window, _cx| {
+        el = el.on_hover(move |&hovered, _window, cx| {
             crate::motion::set_hovered(id, hovered, true);
-            window.refresh();
+            cx.notify(view);
         });
     }
     for event in ctx.events {
@@ -191,10 +194,10 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
                     let enter = ctx.events.contains("mouseEnter");
                     let leave = ctx.events.contains("mouseLeave");
                     let callback = ctx.event_callback.clone();
-                    el = el.on_hover(move |&hovered, window, _cx| {
+                    el = el.on_hover(move |&hovered, _window, cx| {
                         crate::motion::set_hovered(id, hovered, transition);
                         if transition {
-                            window.refresh();
+                            cx.notify(view);
                         }
                         let kind = if hovered { "mouseEnter" } else { "mouseLeave" };
                         if (hovered && enter) || (!hovered && leave) {
@@ -280,6 +283,14 @@ pub trait CustomElementFactory: 'static {
 
     /// Create a new element instance.
     fn create(&self, id: u64) -> Box<dyn CustomElement>;
+
+    /// Whether the element draws from its props and children alone, so a
+    /// `<gpuix-cache>` region holding it may replay a previous frame. False
+    /// for anything that redraws by itself, such as a caret, a loading image
+    /// or a fade.
+    fn cacheable(&self) -> bool {
+        false
+    }
 }
 
 // ── Registry ─────────────────────────────────────────────────────────
@@ -331,6 +342,13 @@ pub struct CustomElementRegistry {
 }
 
 impl CustomElementRegistry {
+    /// Whether elements of this type may be replayed from a cached region.
+    pub fn cacheable(&self, element_type: &str) -> bool {
+        self.factories
+            .get(element_type)
+            .is_some_and(|factory| factory.cacheable())
+    }
+
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),

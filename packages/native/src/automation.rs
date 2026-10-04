@@ -38,7 +38,83 @@ impl ElementBounds {
 }
 
 thread_local! {
-    static BOUNDS: RefCell<HashMap<u64, ElementBounds>> = RefCell::new(HashMap::new());
+    static BOUNDS: RefCell<BoundsRegistry> = RefCell::new(BoundsRegistry::default());
+}
+
+/// Painted boxes, kept per view.
+///
+/// A cached region (`gpuix-cache`) paints from the previous frame without
+/// running its elements' paint callbacks, so nothing would record its boxes
+/// again. Each view's boxes are therefore kept from the last time it painted,
+/// and a box counts while its view is still on screen: the root, or a region
+/// the view that last rendered it still holds.
+#[derive(Default)]
+struct BoundsRegistry {
+    root: Option<gpui::EntityId>,
+    by_view: HashMap<gpui::EntityId, HashMap<u64, ElementBounds>>,
+    /// The view each element was last painted in.
+    owner: HashMap<u64, gpui::EntityId>,
+    /// The regions each view built when it last rendered, and back again.
+    children: HashMap<gpui::EntityId, Vec<gpui::EntityId>>,
+    parent: HashMap<gpui::EntityId, gpui::EntityId>,
+}
+
+impl BoundsRegistry {
+    fn present(&self, mut view: gpui::EntityId) -> bool {
+        loop {
+            if Some(view) == self.root {
+                return true;
+            }
+            match self.parent.get(&view) {
+                Some(&parent) => view = parent,
+                None => return false,
+            }
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<ElementBounds> {
+        let view = *self.owner.get(&id)?;
+        if !self.present(view) {
+            return None;
+        }
+        self.by_view.get(&view)?.get(&id).copied()
+    }
+}
+
+/// A view is about to render afresh: forget the boxes it painted and the
+/// regions it built, which it records again.
+pub fn begin_view(view: gpui::EntityId, root: bool) {
+    BOUNDS.with(|cell| {
+        let mut registry = cell.borrow_mut();
+        if root {
+            registry.root = Some(view);
+        }
+        registry.by_view.entry(view).or_default().clear();
+        for child in registry.children.remove(&view).unwrap_or_default() {
+            if registry.parent.get(&child) == Some(&view) {
+                registry.parent.remove(&child);
+            }
+        }
+    });
+}
+
+/// `view` built the cached region `region` this frame.
+pub fn region_built(view: gpui::EntityId, region: gpui::EntityId) {
+    BOUNDS.with(|cell| {
+        let mut registry = cell.borrow_mut();
+        registry.children.entry(view).or_default().push(region);
+        registry.parent.insert(region, view);
+    });
+}
+
+/// Drop a region's bookkeeping once its element is gone.
+pub fn forget_view(view: gpui::EntityId) {
+    BOUNDS.with(|cell| {
+        let mut registry = cell.borrow_mut();
+        registry.by_view.remove(&view);
+        registry.children.remove(&view);
+        registry.parent.remove(&view);
+    });
 }
 
 /// Zero-size canvas. Keep it ahead of the app subtree under the root.
@@ -50,8 +126,13 @@ thread_local! {
 pub fn bounds_frame_reset() -> impl IntoElement {
     canvas(
         |_, _, _| (),
-        move |_, _, _, _| {
-            BOUNDS.with(|cell| cell.borrow_mut().clear());
+        move |_, _, window, _| {
+            let view = window.current_view();
+            BOUNDS.with(|cell| {
+                if let Some(bounds) = cell.borrow_mut().by_view.get_mut(&view) {
+                    bounds.clear();
+                }
+            });
         },
     )
     .absolute()
@@ -66,7 +147,7 @@ pub fn bounds_frame_reset() -> impl IntoElement {
 /// move the layout box: the wrapper would become the flex item and the image
 /// would lose intrinsic sizing and corner clipping.
 pub fn track_own_bounds<E: gpui::InteractiveElement>(el: E, id: u64) -> E {
-    el.on_painted(move |bounds, _, _| record_bounds(id, bounds))
+    el.on_painted(move |bounds, window, _| record_bounds(id, bounds, window))
 }
 
 /// Record this element's padding box as it paints, as `bounds_tracker` does,
@@ -80,7 +161,7 @@ pub fn track_padding_bounds<E: gpui::InteractiveElement>(
     border: gpui::Edges<Pixels>,
     selection_start: Option<bool>,
 ) -> E {
-    el.on_painted(move |bounds, _, _| {
+    el.on_painted(move |bounds, window, _| {
         let bounds = Bounds::from_corners(
             gpui::point(bounds.left() + border.left, bounds.top() + border.top),
             gpui::point(
@@ -88,33 +169,47 @@ pub fn track_padding_bounds<E: gpui::InteractiveElement>(
                 bounds.bottom() - border.bottom,
             ),
         );
-        record_bounds(id, bounds);
+        record_bounds(id, bounds, window);
         if let Some(selectable) = selection_start {
             crate::text::record_start_region(bounds, selectable);
         }
     })
 }
 
-pub fn record_bounds(id: u64, bounds: Bounds<Pixels>) {
+/// Record `id`'s painted box against the view painting it.
+pub fn record_bounds(id: u64, bounds: Bounds<Pixels>, window: &Window) {
+    let view = window.current_view();
     BOUNDS.with(|cell| {
-        cell.borrow_mut()
+        let mut registry = cell.borrow_mut();
+        registry.owner.insert(id, view);
+        registry
+            .by_view
+            .entry(view)
+            .or_default()
             .insert(id, ElementBounds::from_gpui(bounds));
     });
 }
 
 pub fn get_bounds(id: u64) -> Option<ElementBounds> {
-    BOUNDS.with(|cell| cell.borrow().get(&id).copied())
+    BOUNDS.with(|cell| cell.borrow().get(id))
 }
 
 pub fn all_bounds() -> HashMap<u64, ElementBounds> {
-    BOUNDS.with(|cell| cell.borrow().clone())
+    BOUNDS.with(|cell| {
+        let registry = cell.borrow();
+        registry
+            .owner
+            .keys()
+            .filter_map(|&id| registry.get(id).map(|bounds| (id, bounds)))
+            .collect()
+    })
 }
 
 pub fn bounds_tracker(id: u64, selection_start: Option<bool>) -> impl IntoElement {
     canvas(
         |bounds, _, _| bounds,
-        move |bounds, _, _, _| {
-            record_bounds(id, bounds);
+        move |bounds, _, window, _| {
+            record_bounds(id, bounds, window);
             if let Some(selectable) = selection_start {
                 crate::text::record_start_region(bounds, selectable);
             }

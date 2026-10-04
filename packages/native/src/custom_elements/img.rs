@@ -21,6 +21,10 @@ impl CustomElementFactory for SvgFactory {
     fn create(&self, _id: u64) -> Box<dyn CustomElement> {
         Box::new(SvgElement::default())
     }
+
+    fn cacheable(&self) -> bool {
+        true
+    }
 }
 
 impl CustomElementFactory for ImgFactory {

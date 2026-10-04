@@ -332,11 +332,13 @@ fn update_window_without_view<R>(
     })
 }
 
+/// Redraw after the retained tree changed. A notify, not a refresh: a refresh
+/// throws away every cached region, and each region checks its own subtree
+/// for changes as the root builds it.
 #[cfg(target_os = "macos")]
 fn invalidate_window() -> Result<()> {
-    update_window(|_view, window, cx| {
+    update_window(|_view, _window, cx| {
         cx.notify();
-        window.refresh();
     })
 }
 
@@ -513,7 +515,7 @@ async fn run_ui_commands(
 ) {
     while let Some(command) = commands.next().await {
         let result = match command {
-            UiCommand::Invalidate => refresh_ui_window(window, cx),
+            UiCommand::Invalidate => window.update(cx, |_view, _window, cx| cx.notify()),
             UiCommand::ActivateWindow => window.update(cx, |_view, window, cx| {
                 cx.activate(true);
                 window.activate_window();
@@ -3423,6 +3425,8 @@ pub(crate) struct GpuixView {
     pub(crate) scroll_handles: HashMap<u64, gpui::ScrollHandle>,
     /// Native animation clocks keyed by retained element ID.
     pub(crate) motion_states: HashMap<u64, crate::motion::MotionState>,
+    /// The revision each motion element's state was last synced at.
+    motion_revisions: HashMap<u64, u64>,
     /// Live text selection, shared with the paint closures and the napi methods.
     pub(crate) selection: SharedSelection,
     /// Persistent measurement and scroll state for React-backed virtual lists.
@@ -3436,6 +3440,49 @@ pub(crate) struct GpuixView {
     /// Resolved `highlight` state, keyed by the element that declared it.
     /// Empty in every app that does not use search.
     highlights: HashMap<u64, HighlightCacheEntry>,
+    /// `<gpuix-cache>` regions, keyed by element.
+    regions: HashMap<u64, RegionEntry>,
+    /// Elements whose motion is animating this frame.
+    active_motions: HashSet<u64>,
+}
+
+/// A `<gpuix-cache>` element's view and what it was last built from.
+struct RegionEntry {
+    view: gpui::Entity<RegionView>,
+    /// The subtree revision it last rendered at.
+    revision: Option<u64>,
+    /// Everything in it draws from its props alone, as of `revision`.
+    cacheable: bool,
+    selectable: bool,
+    selection_wash: gpui::Hsla,
+}
+
+/// The view a `<gpuix-cache>` subtree renders in; see `build_cached_region`.
+pub(crate) struct RegionView {
+    id: u64,
+    parent: gpui::WeakEntity<GpuixView>,
+    inherited: Inherited,
+    /// Laid out by GPUI's view cache, alone at the box its parent gave it,
+    /// rather than within its parent's layout.
+    cached: bool,
+}
+
+impl gpui::Render for RegionView {
+    fn render(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::IntoElement;
+        let view = cx.entity_id();
+        let (id, inherited, cached) = (self.id, self.inherited.clone(), self.cached);
+        match self.parent.upgrade() {
+            Some(parent) => parent.update(cx, |root, cx| {
+                root.build_region(id, view, inherited, cached, window, cx)
+            }),
+            None => gpui::Empty.into_any_element(),
+        }
+    }
 }
 
 /// Two-level cache for one element's `highlight`.
@@ -3483,18 +3530,20 @@ fn emit_motion_settled(
 fn sync_motion_states(
     tree: &crate::retained_tree::RetainedTree,
     states: &mut HashMap<u64, crate::motion::MotionState>,
+    revisions: &mut HashMap<u64, u64>,
     now: web_time::Instant,
-) -> (bool, Vec<(u64, u64)>) {
+) -> (bool, Vec<(u64, u64)>, HashSet<u64>) {
     states.retain(|id, _| tree.motion_ids.contains(id));
+    revisions.retain(|id, _| states.contains_key(id));
     let mut active = false;
     let mut settled = Vec::new();
+    let mut animating = HashSet::new();
 
     for &id in &tree.motion_ids {
-        let Some(source) = tree
-            .elements
-            .get(&id)
-            .and_then(|element| element.custom_props.get("motion"))
-        else {
+        let Some(element) = tree.elements.get(&id) else {
+            continue;
+        };
+        let Some(source) = element.custom_props.get("motion") else {
             continue;
         };
         let state = match states.entry(id) {
@@ -3509,17 +3558,26 @@ fn sync_motion_states(
                 }
             }
         };
-        if let Err(error) = state.sync(source, now) {
-            log::warn!("Invalid motion update for element {id}: {error}");
+        // `sync` compares the whole description, and this runs for every
+        // motion element each time the root or a list row builds. Any change
+        // to the element, its props included, moves its revision.
+        let revision = element.subtree_revision;
+        if revisions.insert(id, revision) != Some(revision) {
+            if let Err(error) = state.sync(source, now) {
+                log::warn!("Invalid motion update for element {id}: {error}");
+            }
         }
         let frame = state.frame(now);
         active |= frame.active;
+        if frame.active {
+            animating.insert(id);
+        }
         if frame.just_settled {
             settled.push((id, frame.generation));
         }
     }
 
-    (active, settled)
+    (active, settled, animating)
 }
 
 fn emit_highlight_events(callback: &Option<EventCallback>, events: &[(u64, usize)]) {
@@ -3717,6 +3775,7 @@ impl GpuixView {
             custom_registry: CustomElementRegistry::with_defaults(),
             scroll_handles: HashMap::new(),
             motion_states: HashMap::new(),
+            motion_revisions: HashMap::new(),
             selection,
             virtual_lists: HashMap::new(),
             selection_drag_position: None,
@@ -3724,7 +3783,57 @@ impl GpuixView {
             selection_scroll_task: None,
             clock: crate::automation::AutomationClock::new(),
             highlights: HashMap::new(),
+            regions: HashMap::new(),
+            active_motions: HashSet::new(),
         }
+    }
+
+    /// Build a `<gpuix-cache>` subtree for its `RegionView`, which renders it
+    /// only when GPUI can't replay the previous frame's.
+    fn build_region(
+        &mut self,
+        id: u64,
+        view: gpui::EntityId,
+        inherited: Inherited,
+        cached: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> gpui::AnyElement {
+        use gpui::IntoElement;
+        crate::automation::begin_view(view, false);
+        let tree_arc = self.tree.clone();
+        let tree = tree_arc.lock().unwrap();
+        if !tree.elements.contains_key(&id) {
+            return gpui::Empty.into_any_element();
+        }
+        let callback = self.event_callback.clone();
+        let now = self.clock.now();
+        let mut highlight_events = Vec::new();
+        let keyboard_focus = self.keyboard_focus_path(&tree, window, cx);
+        let mut ctx = BuildCtx {
+            tree: &tree,
+            event_callback: &callback,
+            focus_handles: &self.focus_handles,
+            scroll_handles: &mut self.scroll_handles,
+            custom_registry: &mut self.custom_registry,
+            virtual_lists: &mut self.virtual_lists,
+            motion_states: &mut self.motion_states,
+            now,
+            selection: self.selection.clone(),
+            inherited,
+            highlights: &mut self.highlights,
+            highlight_events: &mut highlight_events,
+            view,
+            keyboard_focus,
+            region_root: Some(id),
+            region_fill: cached,
+            cache_regions: false,
+            regions: &mut self.regions,
+            active_motions: &self.active_motions,
+        };
+        let built = build_element(id, &mut ctx, window, cx);
+        emit_highlight_events(&callback, &highlight_events);
+        built
     }
 
     pub(crate) fn set_live_image(
@@ -3900,8 +4009,12 @@ impl GpuixView {
 
         let callback = self.event_callback.clone();
         let now = self.clock.now();
-        let (motion_active, motion_settled) =
-            sync_motion_states(&tree, &mut self.motion_states, now);
+        let (motion_active, motion_settled, _) = sync_motion_states(
+            &tree,
+            &mut self.motion_states,
+            &mut self.motion_revisions,
+            now,
+        );
         let mut highlight_events = Vec::new();
 
         // Re-resolve against the tree as it is NOW. gpui calls this during
@@ -3943,6 +4056,13 @@ impl GpuixView {
             highlights: &mut self.highlights,
             highlight_events: &mut highlight_events,
             keyboard_focus,
+            // Rows lay out in the prepaint of whichever view holds the list.
+            view: window.current_view(),
+            region_root: None,
+            region_fill: false,
+            cache_regions: false,
+            regions: &mut self.regions,
+            active_motions: &self.active_motions,
         };
         let child = build_element(expected_child_id, &mut build_ctx, window, cx);
         emit_highlight_events(&callback, &highlight_events);
@@ -4074,6 +4194,21 @@ pub(crate) struct BuildCtx<'a> {
     highlight_events: &'a mut Vec<(u64, usize)>,
     /// See `GpuixView::keyboard_focus_path`.
     pub keyboard_focus: Option<Arc<[u64]>>,
+    /// The view these elements paint in: the root, or a cached region. Hover
+    /// changes notify it, so a cached region redraws and nothing else does.
+    pub view: gpui::EntityId,
+    /// The `<gpuix-cache>` element whose own view is building, which builds
+    /// as a plain container there.
+    region_root: Option<u64>,
+    /// That element lays out alone at its cached box, so it fills it.
+    region_fill: bool,
+    /// Whether a region built here may be replayed. Only in the root view:
+    /// GPUI keeps a view's replay ranges in the frame it last painted in, so
+    /// a region replayed inside another region, or inside a list row a
+    /// layout pass can roll back, would later replay the wrong frame's data.
+    cache_regions: bool,
+    regions: &'a mut HashMap<u64, RegionEntry>,
+    active_motions: &'a HashSet<u64>,
 }
 
 /// Style properties that cascade into descendants.
@@ -4839,12 +4974,26 @@ impl gpui::Render for GpuixView {
             .retain(|id, _| tree.elements.contains_key(id));
         self.virtual_lists
             .retain(|id, _| tree.elements.contains_key(id));
+        self.regions.retain(|id, region| {
+            let keep = tree.elements.contains_key(id);
+            if !keep {
+                crate::automation::forget_view(region.view.entity_id());
+            }
+            keep
+        });
+        let root_view = cx.entity_id();
+        crate::automation::begin_view(root_view, true);
         // Build the element tree. custom_registry, focus_handles, and scroll_handles
         // are different fields of self, so Rust allows borrowing all simultaneously.
         let theme = Theme::dark();
         let now = self.clock.now();
-        let (motion_active, motion_settled) =
-            sync_motion_states(&tree, &mut self.motion_states, now);
+        let (motion_active, motion_settled, animating) = sync_motion_states(
+            &tree,
+            &mut self.motion_states,
+            &mut self.motion_revisions,
+            now,
+        );
+        self.active_motions = animating;
         // Pruned by DECLARATION, not existence: an element that drops its
         // `highlight` prop keeps living, and its cached group list holds a copy
         // of every string in its subtree.
@@ -4871,6 +5020,12 @@ impl gpui::Render for GpuixView {
                     highlights: &mut self.highlights,
                     highlight_events: &mut highlight_events,
                     keyboard_focus,
+                    view: root_view,
+                    region_root: None,
+                    region_fill: false,
+                    cache_regions: true,
+                    regions: &mut self.regions,
+                    active_motions: &self.active_motions,
                 };
                 build_element(root_id, &mut ctx, window, cx)
             }
@@ -5029,6 +5184,17 @@ pub(crate) fn build_element(
             ctx.custom_registry.destroy(id);
             build_virtual_list(element, ctx, window, cx)
         }
+        "gpuix-cache" if ctx.region_root == Some(id) => {
+            // Laid out alone at the box its parent gave it, it has to fill that
+            // box: with an automatic size it would shrink to its contents.
+            let filled = ctx.region_fill.then(|| StyleDesc {
+                width: Some(crate::style::DimensionValue::Percentage(1.0)),
+                height: Some(crate::style::DimensionValue::Percentage(1.0)),
+                ..style.cloned().unwrap_or_default()
+            });
+            build_host_container(element, filled.as_ref().or(style), ctx, window, cx)
+        }
+        "gpuix-cache" => build_cached_region(element, style, &parent_inherited, ctx, window, cx),
 
         // Polymorphic dispatch for all custom elements.
         custom_type => {
@@ -5057,6 +5223,7 @@ pub(crate) fn build_element(
                     .style
                     .as_deref()
                     .is_some_and(crate::motion::hover_is_animatable),
+                view: ctx.view,
             };
             ctx.custom_registry
                 .render(custom_type, &element.custom_props, render_ctx, window, cx)
@@ -5065,6 +5232,131 @@ pub(crate) fn build_element(
 
     ctx.inherited = parent_inherited;
     built
+}
+
+/// `<gpuix-cache>`: a subtree that renders in a view of its own, which GPUI
+/// replays from the previous frame while nothing in it changed. Every element
+/// otherwise lays out and paints on every frame, so a list scrolling beside a
+/// sidebar redrew the whole sidebar at each step.
+///
+/// A cached view is laid out without its contents, so the element's size must
+/// come from its style, and it must have no margins or offsets. Only regions
+/// in the root view are replayed; one inside another region or inside a
+/// virtual-list row always renders. A region renders afresh, uncached, in any
+/// frame in which its subtree changed, an animation in it runs, what it
+/// inherits changed, or it holds an element that redraws on its own, such as
+/// an input's caret; the next frame fills the cache again.
+fn build_cached_region(
+    element: &crate::retained_tree::RetainedElement,
+    style: Option<&StyleDesc>,
+    inherited: &Inherited,
+    ctx: &mut BuildCtx,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<GpuixView>,
+) -> gpui::AnyElement {
+    use gpui::prelude::*;
+
+    let id = element.id;
+    let parent = cx.weak_entity();
+    let entry = ctx.regions.entry(id).or_insert_with(|| RegionEntry {
+        view: cx.new(|_| RegionView {
+            id,
+            parent,
+            inherited: inherited.clone(),
+            cached: false,
+        }),
+        revision: None,
+        cacheable: false,
+        selectable: inherited.selectable,
+        selection_wash: inherited.selection_wash,
+    });
+    let changed = entry.revision != Some(element.subtree_revision);
+    if changed {
+        entry.revision = Some(element.subtree_revision);
+        entry.cacheable = region_cacheable(ctx.tree, ctx.custom_registry, id);
+    }
+    let inherited_changed = entry.selectable != inherited.selectable
+        || entry.selection_wash != inherited.selection_wash;
+    entry.selectable = inherited.selectable;
+    entry.selection_wash = inherited.selection_wash;
+    let cacheable = entry.cacheable;
+    let view = entry.view.clone();
+    let fresh = changed
+        || inherited_changed
+        || !cacheable
+        || !ctx.cache_regions
+        || inherited.highlight.is_some()
+        || window.is_a11y_active()
+        || animating_within(ctx.tree, ctx.active_motions, id);
+    view.update(cx, |region, _| {
+        region.inherited = inherited.clone();
+        region.cached = !fresh;
+    });
+    crate::automation::region_built(ctx.view, view.entity_id());
+    if fresh {
+        return view.into_any_element();
+    }
+    let mut layout = gpui::div();
+    if let Some(style) = style {
+        layout = apply_styles(layout, style);
+    }
+    view.cached(layout.style().clone()).into_any_element()
+}
+
+/// Whether everything under `id` draws from its props and children alone, so
+/// the previous frame's pixels stay right until the subtree changes. Selectable
+/// text is left out: a replayed frame doesn't register it for dragging.
+fn region_cacheable(
+    tree: &crate::retained_tree::RetainedTree,
+    registry: &CustomElementRegistry,
+    id: u64,
+) -> bool {
+    let root_hover = tree
+        .elements
+        .get(&id)
+        .and_then(|element| element.style.as_deref())
+        .is_some_and(crate::motion::hover_is_animatable);
+    if root_hover {
+        return false;
+    }
+    let mut stack = vec![id];
+    while let Some(id) = stack.pop() {
+        let Some(element) = tree.elements.get(&id) else {
+            continue;
+        };
+        let kind = element.element_type.as_str();
+        if !matches!(kind, "div" | "text" | "gpuix-cache") && !registry.cacheable(kind) {
+            return false;
+        }
+        let selects = element
+            .style
+            .as_deref()
+            .and_then(|style| style.user_select.as_deref())
+            .is_some_and(|select| select != "none");
+        if selects {
+            return false;
+        }
+        stack.extend(element.children.iter().copied());
+    }
+    true
+}
+
+/// Whether an element under `id`, or `id` itself, is animating.
+fn animating_within(
+    tree: &crate::retained_tree::RetainedTree,
+    animating: &HashSet<u64>,
+    id: u64,
+) -> bool {
+    animating.iter().any(|&animated| {
+        let mut current = Some(animated);
+        while let Some(element) = current {
+            if element == id {
+                return true;
+            }
+            current = tree.elements.get(&element).and_then(|e| e.parent);
+        }
+        false
+    })
 }
 
 fn build_virtual_list(
@@ -5508,10 +5800,11 @@ pub(crate) fn build_host_container(
                         .style
                         .as_deref()
                         .is_some_and(crate::motion::hover_is_animatable);
-                    el = el.on_hover(move |&is_hovered, window, _cx| {
+                    let view = ctx.view;
+                    el = el.on_hover(move |&is_hovered, _window, cx| {
                         crate::motion::set_hovered(id, is_hovered, transition);
                         if transition {
-                            window.refresh();
+                            cx.notify(view);
                         }
                         if is_hovered {
                             emit_event_full(&callback_enter, id, "mouseEnter", |p| {
@@ -5617,9 +5910,10 @@ pub(crate) fn build_host_container(
             .is_some_and(crate::motion::hover_is_animatable)
     {
         let id = element.id;
-        el = el.on_hover(move |&is_hovered, window, _cx| {
+        let view = ctx.view;
+        el = el.on_hover(move |&is_hovered, _window, cx| {
             crate::motion::set_hovered(id, is_hovered, true);
-            window.refresh();
+            cx.notify(view);
         });
     }
 
