@@ -300,6 +300,137 @@ fn line_starts(source: &str) -> Vec<usize> {
 }
 
 /// Highlight a document with the default limits.
+/// Compile the common grammars before any code block needs them. syntect
+/// compiles each context's regexes the first time a highlight enters it, on
+/// whichever thread asks, and shares them; left to the frame that first shows
+/// a TypeScript block, that was 10-20ms. The samples reach the constructs code
+/// in a conversation usually has. Run it on a background thread.
+pub fn prewarm() {
+    for (tag, source) in PREWARM {
+        let _ = highlight(HighlightRequest {
+            source,
+            path: None,
+            fence_tag: Some(tag),
+        });
+    }
+}
+
+const PREWARM_TS: &str = r#"import { useEffect, type ReactNode } from "react";
+import * as path from "node:path";
+export type Row<T extends object = {}> = { id: number; value?: T | null; tags: string[] };
+export interface Props extends Base { readonly name: string; onClick?: (e: Event) => void }
+enum Kind { A = 1, B = "b" }
+/** Doc comment with {@link Row}. */
+export async function load<T>(url: string, init: RequestInit = {}): Promise<T[]> {
+  const res = await fetch(`${url}?q=${encodeURIComponent(init.method ?? "GET")}`);
+  if (!res.ok) throw new Error(`failed: ${res.status}`);
+  const data = (await res.json()) as T[];
+  return data.filter((x) => x != null).map((x, i) => ({ ...x, i }));
+}
+class Store<K, V> extends Map<K, V> implements Iterable<[K, V]> {
+  private count = 0;
+  static create(): Store<string, number> { return new Store(); }
+  get size2(): number { return this.count * 2; }
+  @decorator() method(a: number, ...rest: unknown[]): void {
+    for (const [k, v] of this) console.log(k, v, /\d+\.?\d*/g.test(String(a)));
+    let x = a > 0 ? a : -a; x ||= 1; x ??= 2;
+    switch (typeof x) { case "number": break; default: return; }
+    try { JSON.parse("{}"); } catch (error: unknown) { void error; } finally { this.count++; }
+  }
+}
+const obj = { a: 1, "b-c": [true, false, null, undefined], [Symbol.iterator]: 0n, d: 0x1f, e: 1e-3 };
+// line comment
+/* block
+   comment */
+export default obj satisfies Record<string, unknown>;
+"#;
+
+const PREWARM_TSX: &str = r#"import { useState } from "react";
+export function List<T>({ items, render }: { items: T[]; render: (item: T) => JSX.Element }) {
+  const [open, setOpen] = useState<boolean>(false);
+  return (
+    <div className="list" style={{ width: 100, color: "red" }} onClick={() => setOpen(!open)}>
+      {open && items.map((item, i) => <Item key={i} value={item} {...props} />)}
+      <>{/* comment */}text &amp; more</>
+      <input disabled value={`${open}`} />
+    </div>
+  );
+}
+const a = <T,>(x: T) => x;
+"#;
+
+const PREWARM_RUST: &str = r#"use std::{collections::HashMap, sync::{Arc, Mutex}};
+/// Doc comment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tab<'a, T: Clone + Send> { id: u64, name: &'a str, items: Vec<T>, map: HashMap<String, Option<T>> }
+pub enum Event { Message { id: String, text: String }, Done(u32), Error(String) }
+impl<'a, T: Clone + Send> Tab<'a, T> {
+    pub fn new(name: &'a str) -> Self { Self { id: 0, name, items: vec![], map: HashMap::new() } }
+    pub async fn run(&mut self, x: i64) -> Result<(), String> {
+        let s = format!("{} {x:?} {}", self.name, r"raw\n");
+        if let Some(Some(v)) = self.map.get("k") { let _ = v.clone(); }
+        match x { 0..=9 => {}, n if n < 0 => return Err("neg".into()), _ => unreachable!() }
+        for (i, item) in self.items.iter().enumerate().rev() { let _ = (i, item, 1.5e3, 0xff_u8, b'a', 'c'); }
+        let shared = Arc::new(Mutex::new(0usize)); *shared.lock().unwrap() += 1;
+        let f = |a: &str| -> usize { a.len() }; let _ = f(&s);
+        unsafe { std::ptr::null::<u8>(); }
+        Ok(())
+    }
+}
+// line comment
+/* block */
+macro_rules! m { ($e:expr) => { $e }; }
+const MAX: usize = 1 << 10;
+static NAME: &str = "slate";
+"#;
+
+const PREWARM_SH: &str = r#"#!/bin/bash
+set -euo pipefail
+export PATH="$HOME/bin:$PATH"
+for f in $(ls *.ts); do echo "file: ${f%.ts} $((1 + 2))"; done
+if [ -n "$1" ] && [[ $2 == *.rs ]]; then cat <<'EOF' | grep -E 'a|b' > out.txt; fi
+text
+EOF
+fn() { local x=${1:-default}; return 0; }
+case "$x" in a) echo a ;; *) echo other ;; esac
+bun run typecheck 2>&1 | tail -n 5 # comment
+"#;
+
+const PREWARM_PY: &str = r#"from __future__ import annotations
+import os, json
+@dataclass(frozen=True)
+class Row(Base):
+    """Docstring."""
+    id: int = 0
+    def load(self, path: str, *args, **kwargs) -> list[dict[str, int]] | None:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return [x for x in data if x.get("a") is not None and x["b"] > 1.5]
+async def main():
+    await asyncio.sleep(0.1)
+    print(f"{os.getcwd()!r} {1 + 2:>4}", r"\d+", b"bytes")
+# comment
+lambda x: x ** 2
+"#;
+
+const PREWARM: &[(&str, &str)] = &[
+    ("ts", PREWARM_TS),
+    ("tsx", PREWARM_TSX),
+    ("js", "const a = async (b) => { await f(`x${b}`); return [1, 'a', /r/g, null]; }; // c\n"),
+    ("rust", PREWARM_RUST),
+    ("sh", PREWARM_SH),
+    ("powershell", "$a = Get-ChildItem -Path . | Where-Object { $_.Length -gt 1kb }; Write-Output \"$($a.Count)\" # c\n"),
+    ("json", "{\"a\": [1, 2.5, true, null], \"b\": {\"c\": \"d\"}}\n"),
+    ("py", PREWARM_PY),
+    ("toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nb = { version = \"1\", features = [\"c\"] } # c\n"),
+    ("yaml", "a:\n  - b: 1\n    c: \"d\"\n  - e: [1, 2]\n# c\n"),
+    ("css", ".a > b:hover { color: #fff; margin: 0 auto !important; } @media (max-width: 10px) { a { b: c; } }\n"),
+    ("html", "<!doctype html><div class=\"a\" id='b'><!-- c --><script>let a = 1;</script></div>\n"),
+    ("go", "package main\nimport \"fmt\"\nfunc main() { x := []int{1}; fmt.Println(x, \"a\") } // c\n"),
+    ("c", "#include <stdio.h>\nint main(void) { printf(\"%d\\n\", 1); return 0; } /* c */\n"),
+    ("md", "# a\n**b** `c` [d](e)\n- f\n"),
+];
+
 pub fn highlight(request: HighlightRequest<'_>) -> Result<HighlightedDocument, HighlightError> {
     highlight_with_limits(request, HighlightLimits::default())
 }
