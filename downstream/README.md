@@ -53,7 +53,7 @@ GPUIX:
   layers centred on their trigger; navigation mouse buttons.
 - Window chrome: `clientDecorations` and `<gpuix-caption action>` for native
   dragging, Snap and caption buttons in an app-drawn title bar;
-  `getWindowState()` for maximized, active and appearance.
+  `getWindowState()` for maximized, active, appearance and display scale.
 - `fonts` loads font files before the window opens.
 - `<img>` files and URLs load through a bounded memory (`imageMemoryMb`,
   default 256) that drops the least recently drawn images.

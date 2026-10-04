@@ -23,6 +23,9 @@ pub struct WindowState {
     pub dark: bool,
     pub width: f64,
     pub height: f64,
+    /// Device pixels per logical pixel on the window's display, for sizing
+    /// images fetched for it.
+    pub scale: f64,
 }
 
 static STATE: Mutex<WindowState> = Mutex::new(WindowState {
@@ -33,6 +36,7 @@ static STATE: Mutex<WindowState> = Mutex::new(WindowState {
     dark: true,
     width: 0.0,
     height: 0.0,
+    scale: 1.0,
 });
 static OBSERVING: AtomicBool = AtomicBool::new(false);
 
@@ -81,6 +85,7 @@ pub fn update<V: 'static>(window: &mut gpui::Window, cx: &mut gpui::Context<V>) 
     );
     state.width = f32::from(size.width) as f64;
     state.height = f32::from(size.height) as f64;
+    state.scale = window.scale_factor() as f64;
 }
 
 pub fn get() -> WindowState {

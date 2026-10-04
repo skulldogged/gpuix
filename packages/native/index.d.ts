@@ -578,4 +578,9 @@ export interface WindowState {
   dark: boolean
   width: number
   height: number
+  /**
+   * Device pixels per logical pixel on the window's display, for sizing
+   * images fetched for it.
+   */
+  scale: number
 }
