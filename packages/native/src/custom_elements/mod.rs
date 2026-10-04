@@ -161,7 +161,7 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
     // also tracks hover transitions, so this covers elements without it.
     if transition && !ctx.events.contains("mouseEnter") && !ctx.events.contains("mouseLeave") {
         el = el.on_hover(move |&hovered, window, _cx| {
-            crate::motion::set_hovered(id, hovered);
+            crate::motion::set_hovered(id, hovered, true);
             window.refresh();
         });
     }
@@ -190,8 +190,8 @@ pub(crate) fn wire_standard_events<E: gpui::StatefulInteractiveElement>(
                     let leave = ctx.events.contains("mouseLeave");
                     let callback = ctx.event_callback.clone();
                     el = el.on_hover(move |&hovered, window, _cx| {
+                        crate::motion::set_hovered(id, hovered, transition);
                         if transition {
-                            crate::motion::set_hovered(id, hovered);
                             window.refresh();
                         }
                         let kind = if hovered { "mouseEnter" } else { "mouseLeave" };

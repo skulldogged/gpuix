@@ -4983,7 +4983,10 @@ pub(crate) fn build_element(
         None
     };
     let style = animated_style.as_ref().or(element.style.as_deref());
-    let hovered_style = style.and_then(|style| crate::motion::hover_blended(id, style, ctx.now));
+    let hover_listened =
+        element.events.contains("mouseEnter") || element.events.contains("mouseLeave");
+    let hovered_style = style
+        .and_then(|style| crate::motion::hover_blended(id, style, hover_listened, ctx.now));
     if hovered_style.as_ref().is_some_and(|(_, active)| *active) {
         window.request_animation_frame();
     }
@@ -5504,8 +5507,8 @@ pub(crate) fn build_host_container(
                         .as_deref()
                         .is_some_and(crate::motion::hover_is_animatable);
                     el = el.on_hover(move |&is_hovered, window, _cx| {
+                        crate::motion::set_hovered(id, is_hovered, transition);
                         if transition {
-                            crate::motion::set_hovered(id, is_hovered);
                             window.refresh();
                         }
                         if is_hovered {
@@ -5613,7 +5616,7 @@ pub(crate) fn build_host_container(
     {
         let id = element.id;
         el = el.on_hover(move |&is_hovered, window, _cx| {
-            crate::motion::set_hovered(id, is_hovered);
+            crate::motion::set_hovered(id, is_hovered, true);
             window.refresh();
         });
     }

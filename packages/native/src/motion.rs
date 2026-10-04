@@ -511,23 +511,48 @@ pub(crate) fn hover_is_animatable(style: &StyleDesc) -> bool {
 }
 
 /// Records the pointer entering or leaving an element, continuing from
-/// wherever an interrupted transition had reached.
-pub(crate) fn set_hovered(id: u64, hovered: bool) {
+/// wherever an interrupted transition had reached. An element whose `hover`
+/// can't ease right now, such as a selected row that drops its hover, still
+/// reports its edges so a `hover` it gets back starts from where the pointer
+/// is: fully lit if inside, forgotten if not.
+pub(crate) fn set_hovered(id: u64, hovered: bool, animate: bool) {
     let now = Instant::now();
     HOVERS.with(|hovers| {
         let mut hovers = hovers.borrow_mut();
-        let from = hovers
-            .get(&id)
-            .map_or(if hovered { 0.0 } else { 1.0 }, |track| track.progress(now).0);
+        if !animate {
+            if hovered {
+                hovers.insert(id, HoverTrack { hovered, since: now, from: 1.0 });
+            } else {
+                hovers.remove(&id);
+            }
+            return;
+        }
+        let from = hovers.get(&id).map_or(0.0, |track| track.progress(now).0);
         hovers.insert(id, HoverTrack { hovered, since: now, from });
     });
 }
 
 /// `style` with its `hover` colors and opacity blended in by the element's
 /// hover progress and removed from the refinement. The flag is true while the
-/// transition is still running.
-pub(crate) fn hover_blended(id: u64, style: &StyleDesc, now: Instant) -> Option<(StyleDesc, bool)> {
+/// transition is still running. `listened` is whether the element reports
+/// hover edges even without a `hover` that eases, through enter/leave
+/// listeners.
+pub(crate) fn hover_blended(
+    id: u64,
+    style: &StyleDesc,
+    listened: bool,
+    now: Instant,
+) -> Option<(StyleDesc, bool)> {
     if !hover_is_animatable(style) {
+        // Nothing reports the pointer leaving an element without a listener,
+        // and a finished fade-out needs no track, so either entry would only
+        // light up a `hover` the element gets back later.
+        HOVERS.with(|hovers| {
+            let mut hovers = hovers.borrow_mut();
+            if hovers.get(&id).is_some_and(|track| !listened || !track.hovered) {
+                hovers.remove(&id);
+            }
+        });
         return None;
     }
     let hover = style.hover.as_deref()?;
