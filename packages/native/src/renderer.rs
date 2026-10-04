@@ -915,9 +915,68 @@ pub struct GpuixRenderer {
     ui_running: Arc<AtomicBool>,
 }
 
+/// A code block for JavaScript to highlight; see [`GpuixRenderer::on_highlight`].
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi(object)]
+pub struct HighlightRequest {
+    pub id: u32,
+    pub code: String,
+    /// The Markdown fence tag or `<code>` language, as written.
+    pub language: Option<String>,
+    pub path: Option<String>,
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[napi]
 impl GpuixRenderer {
+    /// Highlight code in JavaScript: `callback` gets each code block missing
+    /// from the syntax cache, and answers through [`Self::answer_highlight`].
+    #[napi]
+    pub fn on_highlight(&self, callback: ThreadsafeFunction<HighlightRequest>) {
+        let callback = Arc::new(callback);
+        crate::syntax::cache::set_provider(Some(Arc::new(
+            move |request: crate::syntax::cache::Request| {
+                let request = HighlightRequest {
+                    id: request.id,
+                    code: request.code,
+                    language: request.language,
+                    path: request.path,
+                };
+                callback.call(Ok(request), ThreadsafeFunctionCallMode::NonBlocking);
+            },
+        )));
+    }
+
+    /// Answer highlight request `id`. `spans` holds `[start, end, kind]`
+    /// triples: UTF-8 byte ranges into the request's code, and indices into
+    /// `kinds`, which names `HighlightKind`s in camelCase. `null` spans mean
+    /// the code can't be highlighted.
+    #[napi]
+    pub fn answer_highlight(
+        &self,
+        id: u32,
+        kinds: Vec<String>,
+        spans: Option<Uint32Array>,
+    ) -> Result<()> {
+        let kinds: Vec<_> = kinds
+            .iter()
+            .map(|name| crate::syntax::HighlightKind::from_name(name))
+            .collect();
+        let spans = spans.map(|spans| {
+            spans
+                .chunks_exact(3)
+                .filter_map(|span| {
+                    Some(crate::syntax::HighlightSpan {
+                        range: span[0] as usize..span[1] as usize,
+                        kind: (*kinds.get(span[2] as usize)?)?,
+                    })
+                })
+                .collect()
+        });
+        crate::syntax::cache::fulfill(id, spans);
+        self.request_invalidate()
+    }
+
     fn event_callback_for_view(&self) -> Option<EventCallback> {
         self.event_callback.lock().unwrap().clone().map(|tsf| {
             Arc::new(move |payload: EventPayload| {

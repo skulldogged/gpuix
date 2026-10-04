@@ -98,6 +98,38 @@ pub enum HighlightKind {
 }
 
 impl HighlightKind {
+    /// The kind a highlight provider names in camelCase, like `typeBuiltin`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "comment" => Self::Comment,
+            "keyword" => Self::Keyword,
+            "string" => Self::String,
+            "stringSpecial" => Self::StringSpecial,
+            "escape" => Self::Escape,
+            "number" => Self::Number,
+            "boolean" => Self::Boolean,
+            "type" => Self::Type,
+            "typeBuiltin" => Self::TypeBuiltin,
+            "constructor" => Self::Constructor,
+            "function" => Self::Function,
+            "functionBuiltin" => Self::FunctionBuiltin,
+            "macro" => Self::Macro,
+            "property" => Self::Property,
+            "constant" => Self::Constant,
+            "variable" => Self::Variable,
+            "variableSpecial" => Self::VariableSpecial,
+            "parameter" => Self::Parameter,
+            "operator" => Self::Operator,
+            "punctuation" => Self::Punctuation,
+            "tag" => Self::Tag,
+            "attribute" => Self::Attribute,
+            "label" => Self::Label,
+            "embedded" => Self::Embedded,
+            "invalid" => Self::Invalid,
+            _ => return None,
+        })
+    }
+
     /// Stable precedence used to resolve overlapping parser captures.
     /// Without it, nested captures resolve by iteration order and a string
     /// inside a macro flickers between two colours across parses.
@@ -126,7 +158,9 @@ pub struct HighlightSpan {
 /// Highlight spans grouped per source line, sorted and non-overlapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightedDocument {
-    pub language: LanguageId,
+    /// `None` when a [`cache::set_provider`] provider highlighted it, which
+    /// can know languages this module doesn't.
+    pub language: Option<LanguageId>,
     pub lines: Vec<Vec<HighlightSpan>>,
 }
 
@@ -163,7 +197,7 @@ impl HighlightedDocument {
     /// Validate, split and normalize absolute source spans into line-relative
     /// spans. A span that crosses a newline becomes one span per line.
     pub fn from_absolute_spans(
-        language: LanguageId,
+        language: Option<LanguageId>,
         source: &str,
         spans: impl IntoIterator<Item = HighlightSpan>,
     ) -> Result<Self, HighlightError> {
@@ -483,7 +517,7 @@ pub fn highlight_with_limits(
         }
     }
 
-    HighlightedDocument::from_absolute_spans(language, request.source, spans)
+    HighlightedDocument::from_absolute_spans(Some(language), request.source, spans)
 }
 
 fn syntax_set() -> &'static SyntaxSet {

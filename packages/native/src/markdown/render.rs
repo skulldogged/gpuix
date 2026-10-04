@@ -19,7 +19,8 @@ use gpui::{
 };
 
 use super::parser::{Block, BlockTree, InlineRun, InlineStyle, TableAlign};
-use crate::syntax::cache::highlight_cached;
+use crate::syntax::cache::{lookup, Lookup};
+use crate::syntax::HighlightedDocument;
 use crate::text::{range_rects, runs::runs_for_spans, SharedSelection};
 use crate::theme::{Metrics, Theme};
 
@@ -197,6 +198,12 @@ pub struct MdContext {
     /// rendering by the element, which has the window and app a load needs.
     pub images: HashMap<String, ImageLoad>,
     next_image: usize,
+    /// Each code block's last highlight, by its place among the document's
+    /// code blocks. A streaming block is new code at every update, and this
+    /// keeps its lines coloured until that code's highlight lands. The element
+    /// keeps it between frames.
+    pub code_highlights: HashMap<usize, Arc<HighlightedDocument>>,
+    pub next_code: usize,
 }
 
 /// An image's state for this frame.
@@ -300,6 +307,8 @@ impl MdContext {
             arriving: false,
             images: HashMap::new(),
             next_image: 0,
+            code_highlights: HashMap::new(),
+            next_code: 0,
         }
     }
 
@@ -708,7 +717,19 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &mut MdContext) ->
     let theme = ctx.theme.clone();
     let m = &theme.metrics;
     let mono = font(theme.font_mono.clone());
-    let highlight = highlight_cached(code, None, language);
+    let ordinal = ctx.next_code;
+    ctx.next_code += 1;
+    let highlight = match lookup(code, None, language) {
+        Lookup::Ready(document) => {
+            ctx.code_highlights.insert(ordinal, document.clone());
+            Some(document)
+        }
+        Lookup::Pending => ctx.code_highlights.get(&ordinal).cloned(),
+        Lookup::Unsupported => {
+            ctx.code_highlights.remove(&ordinal);
+            None
+        }
+    };
 
     // overflow-x only works as a flex *row* viewport. A flex_col scroller
     // stretches each nowrap row to the card width, so the line never overflows

@@ -18,6 +18,7 @@
 //! so the closure can capture an `Rc` and build only visible rows. The default
 //! flow path renders the same rows in a column so a parent can be the scroller.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -29,7 +30,7 @@ use crate::diff::{
     FileDiff, LineKind,
 };
 use crate::renderer::emit_event_full;
-use crate::syntax::cache::highlight_cached;
+use crate::syntax::cache::{lookup, Lookup};
 use crate::syntax::HighlightSpan;
 use crate::text::runs::runs_for_spans;
 use crate::text::{range_rects, SharedSelection};
@@ -64,7 +65,10 @@ struct DiffData {
     rows: Vec<DiffRow>,
     /// Per-file highlight, indexed by file. `None` when the language is
     /// unknown or the file is binary, which renders plain.
-    highlights: Vec<Option<FileHighlight>>,
+    highlights: RefCell<Vec<Option<FileHighlight>>>,
+    /// Files whose highlight was still on its way at the last look; they
+    /// render plain until it lands.
+    pending: RefCell<Vec<usize>>,
     show_word_diff: bool,
 }
 
@@ -137,14 +141,25 @@ impl DiffElement {
         if self.show_word_diff {
             annotate_word_diffs(&mut files);
         }
-        let highlights = files.iter().map(file_highlight).collect();
+        let mut pending = Vec::new();
+        let highlights = files
+            .iter()
+            .enumerate()
+            .map(|(ix, file)| {
+                file_highlight(file).unwrap_or_else(|| {
+                    pending.push(ix);
+                    None
+                })
+            })
+            .collect();
         let collapsed = self.collapsed.clone();
         let rows = flatten_rows(&files, |path| collapsed.contains(path), self.max_lines);
 
         let data = Rc::new(DiffData {
             files,
             rows,
-            highlights,
+            highlights: RefCell::new(highlights),
+            pending: RefCell::new(pending),
             show_word_diff: self.show_word_diff,
         });
         self.fingerprint = Some(fingerprint);
@@ -185,9 +200,11 @@ const MAX_HIGHLIGHT_LINES: usize = 200_000;
 /// Syntax state still cannot be recovered from source the patch never contained
 /// — a block comment that opens above the hunk will not tint it. That is
 /// inherent to highlighting a diff, and Comet accepts the same limit.
-fn file_highlight(file: &FileDiff) -> Option<FileHighlight> {
+///
+/// `None` while either side's highlight is still on its way.
+fn file_highlight(file: &FileDiff) -> Option<Option<FileHighlight>> {
     if file.binary || file.path.is_empty() {
-        return None;
+        return Some(None);
     }
     let mut old_visible: Vec<(u32, &str)> = Vec::new();
     let mut new_visible: Vec<(u32, &str)> = Vec::new();
@@ -213,29 +230,58 @@ fn file_highlight(file: &FileDiff) -> Option<FileHighlight> {
     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
     let old = highlight_side(&old_visible, old_max, old_path);
     let new = highlight_side(&new_visible, new_max, &file.path);
-    (!old.is_empty() || !new.is_empty()).then_some(FileHighlight { old, new })
+    let (Some(old), Some(new)) = (old, new) else {
+        return None;
+    };
+    Some((!old.is_empty() || !new.is_empty()).then_some(FileHighlight { old, new }))
 }
 
 /// Parse the visible lines of one side and scatter the resulting spans into a
-/// table indexed by real line number.
-fn highlight_side(visible: &[(u32, &str)], max_line: u32, path: &str) -> Vec<Vec<HighlightSpan>> {
+/// table indexed by real line number, or `None` while it is on its way.
+fn highlight_side(
+    visible: &[(u32, &str)],
+    max_line: u32,
+    path: &str,
+) -> Option<Vec<Vec<HighlightSpan>>> {
     if visible.is_empty() || max_line as usize > MAX_HIGHLIGHT_LINES {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let source = visible
         .iter()
         .map(|(_, text)| *text)
         .collect::<Vec<_>>()
         .join("\n");
-    let Some(document) = highlight_cached(&source, Some(path), None) else {
-        return Vec::new();
+    let document = match lookup(&source, Some(path), None) {
+        Lookup::Ready(document) => document,
+        Lookup::Pending => return None,
+        Lookup::Unsupported => return Some(Vec::new()),
     };
     let mut lines = vec![Vec::new(); max_line as usize];
     for ((number, _), spans) in visible.iter().zip(document.lines.iter()) {
         // `number` is 1-based and non-zero by construction above.
         lines[*number as usize - 1] = spans.clone();
     }
-    lines
+    Some(lines)
+}
+
+impl DiffData {
+    /// Look again for highlights that were on their way. The parse is built
+    /// once per patch, so a file that asked on that frame would otherwise
+    /// stay plain.
+    fn refresh_highlights(&self) {
+        let mut pending = self.pending.borrow_mut();
+        if pending.is_empty() {
+            return;
+        }
+        let mut highlights = self.highlights.borrow_mut();
+        pending.retain(|&ix| match file_highlight(&self.files[ix]) {
+            Some(highlight) => {
+                highlights[ix] = highlight;
+                false
+            }
+            None => true,
+        });
+    }
 }
 
 impl CustomElement for DiffElement {
@@ -248,6 +294,9 @@ impl CustomElement for DiffElement {
         use gpui::prelude::*;
 
         let (data, rebuilt) = self.rebuild_if_needed();
+        if !rebuilt {
+            data.refresh_highlights();
+        }
         let theme = self.theme.clone();
         let metrics = theme.metrics;
 
@@ -561,8 +610,8 @@ fn render_row(data: &DiffData, ix: usize, ctx: RowContext) -> gpui::AnyElement {
             else {
                 return gpui::Empty.into_any_element();
             };
-            let spans = data
-                .highlights
+            let highlights = data.highlights.borrow();
+            let spans = highlights
                 .get(file as usize)
                 .and_then(|h| h.as_ref())
                 .map(|h| h.spans_for(diff_line))

@@ -31,7 +31,10 @@ use gpui::{px, Font, Hsla, SharedString};
 
 use super::{CustomElement, CustomElementFactory, CustomRenderContext};
 use crate::style::StyleDesc;
-use crate::syntax::{cache::highlight_cached, HighlightedDocument};
+use crate::syntax::{
+    cache::{lookup, Lookup},
+    HighlightedDocument,
+};
 use crate::text::runs::runs_for_spans;
 use crate::theme::{Metrics, Theme};
 
@@ -76,9 +79,18 @@ impl CodeElement {
         if self.highlight_key == Some(key) {
             return self.highlight.clone();
         }
-        self.highlight_key = Some(key);
-        self.highlight =
-            highlight_cached(&self.code, self.path.as_deref(), self.language.as_deref());
+        match lookup(&self.code, self.path.as_deref(), self.language.as_deref()) {
+            Lookup::Ready(document) => {
+                self.highlight_key = Some(key);
+                self.highlight = Some(document);
+            }
+            // The last highlight stands in, and the next frame asks again.
+            Lookup::Pending => {}
+            Lookup::Unsupported => {
+                self.highlight_key = Some(key);
+                self.highlight = None;
+            }
+        }
         self.highlight.clone()
     }
 }

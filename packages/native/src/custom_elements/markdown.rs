@@ -60,6 +60,8 @@ pub struct MarkdownElement {
     painted: Option<web_time::Instant>,
     /// Folder that relative image paths resolve against.
     image_base: Option<std::path::PathBuf>,
+    /// See [`crate::markdown::render::MdContext::code_highlights`].
+    code_highlights: std::collections::HashMap<usize, Arc<crate::syntax::HighlightedDocument>>,
 }
 
 impl MarkdownElement {
@@ -152,7 +154,12 @@ impl CustomElement for MarkdownElement {
         if let Some(veil) = &mut md.veil {
             veil.live = live;
         }
+        md.code_highlights = std::mem::take(&mut self.code_highlights);
         let body = render_tree(&tree, &mut md, window);
+        let code_blocks = md.next_code;
+        self.code_highlights = std::mem::take(&mut md.code_highlights);
+        self.code_highlights
+            .retain(|ordinal, _| *ordinal < code_blocks);
         if let Some(mut veil) = md.veil.take() {
             veil.finish_frame();
             let animating = std::mem::take(&mut veil.animating);
