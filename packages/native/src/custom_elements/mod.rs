@@ -377,10 +377,7 @@ impl CustomElementRegistry {
         registry.register(Box::new(anchored::AnchoredFactory));
         registry.register(Box::new(caption::CaptionFactory));
         #[cfg(not(target_family = "wasm"))]
-        {
-            registry.register(Box::new(crate::aurelia::WaveFactory));
-            registry.register(Box::new(crate::aurelia::LyricsFactory));
-        }
+        crate::aurelia::register(&mut registry);
         registry.register(Box::new(img::ImgFactory));
         registry.register(Box::new(img::SvgFactory));
         registry.register(Box::new(code::CodeFactory));
